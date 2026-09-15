@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Skill evaluation grade",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "overall_pass": { "type": "boolean" },
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "pass": { "type": "boolean" },
+          "points": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "notes": { "type": "string" }
+        },
+        "required": ["id", "pass", "points", "notes"]
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["overall_pass", "score", "checks", "limitations"]
+}
