@@ -934,6 +934,7 @@ def run_trial(
     semantic_judges: int,
     timeout: int,
     model: str | None,
+    semantic_deferred: bool = False,
 ) -> dict[str, Any]:
     if run_dir.exists():
         raise HarnessError(f"refusing to overwrite run: {run_dir}")
@@ -1175,7 +1176,13 @@ def run_trial(
             "errors": [],
             "judges": [],
         }
-        print("      skipped: disabled by --no-semantic-judges", flush=True)
+        if semantic_deferred:
+            print(
+                "      deferred: batched and parallelised after all workers",
+                flush=True,
+            )
+        else:
+            print("      skipped: disabled by --no-semantic-judges", flush=True)
 
     print("  [7/7] Finalizing artifacts and writing the result", flush=True)
     deterministic_result = deterministic.get("result")

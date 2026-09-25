@@ -399,6 +399,12 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     results = []
     pending_semantic = []
     try:
+        if args.parallel:
+            print(
+                f"\n########## Phase 1: {worker_trials} worker(s) + deterministic "
+                f"grading (sequential) ##########",
+                flush=True,
+            )
         for case in selected:
             for configuration in configurations:
                 for trial in range(1, args.trials + 1):
@@ -426,6 +432,11 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
                         semantic_judges=args.judges,
                         timeout=DEFAULT_TIMEOUT_SECONDS,
                         model=None,
+                        semantic_deferred=(
+                            args.parallel
+                            and semantic_enabled
+                            and case.expected is not None
+                        ),
                     )
                     results.append(result)
                     if args.parallel and semantic_enabled and case.expected is not None:
@@ -437,8 +448,8 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
                     )
         if pending_semantic:
             print(
-                f"\n=== Batching {len(pending_semantic)} semantic grader(s) "
-                f"in parallel ===",
+                f"\n########## Phase 2: {len(pending_semantic)} semantic judge(s) "
+                f"(parallel) ##########",
                 flush=True,
             )
             with ThreadPoolExecutor(max_workers=len(pending_semantic)) as executor:
@@ -456,6 +467,11 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
                 }
                 for future in as_completed(futures):
                     results[futures[future]] = future.result()
+        if args.parallel:
+            print(
+                "\n########## Phase 3: writing report ##########",
+                flush=True,
+            )
     except KeyboardInterrupt:
         experiment["status"] = "interrupted"
         experiment["completed_at"] = now()
