@@ -421,6 +421,15 @@ parallel when `expected.md` is present.
 | `--trials N` | `1` | Repeat each test-case/configuration cell `N` times |
 | `--judges N` | `3` | Use `N` parallel semantic judges for each worker trial |
 | `--no-semantic-judges` | Off | Run the worker and `check.py`, but make no semantic-judge model calls |
+| `--parallel` | Off | Run every worker first, then batch all semantic judges together in parallel |
+
+`--parallel` splits a run into two phases: all workers (and their deterministic
+graders) run first in the normal sequence, then the semantic graders for every
+completed trial are launched together in one pool instead of after each worker.
+Workers still run one at a time; only the judge phase is parallelised across
+trials. This shortens wall-clock when judges are a large share of the run
+(for example many trials with `--judges 1`) without changing any trial's
+result. It has no effect with `--no-semantic-judges`.
 
 `--no-semantic-judges` rejects a selected test case that has no `check.py`.
 This happens before an experiment is created or any model is called. The flag

@@ -1247,3 +1247,53 @@ def run_trial(
     }
     write_json(run_dir / "result.json", result)
     return result
+
+
+def regrade_with_semantic(
+    *,
+    case: Case,
+    run_dir: Path,
+    schema: Path,
+    timeout: int,
+    model: str | None,
+    judge_count: int,
+) -> dict[str, Any]:
+    """Add semantic grading to a trial already run without judges, and rewrite
+    its result.json. Used by the parallel path so judges can be batched after
+    all workers finish. Reuses run_semantic_grader and the persisted grades."""
+    result = read_json(run_dir / "result.json") or {}
+    semantic = run_semantic_grader(case, run_dir, schema, timeout, model, judge_count)
+    deterministic = read_json(run_dir / "grades" / "deterministic" / "result.json") or {
+        "status": "not_requested",
+        "result": None,
+        "errors": [],
+    }
+
+    requested = [g for g in (deterministic, semantic) if g["status"] != "not_requested"]
+    graders_valid = bool(requested) and all(g["status"] == "completed" for g in requested)
+    graders_pass = graders_valid and all(
+        bool(g["result"].get("overall_pass")) for g in requested
+    )
+    det_result = deterministic.get("result")
+    sem_result = semantic.get("result")
+    headline = sem_result if isinstance(sem_result, dict) else det_result
+    protected = result.get("protected_inputs_intact", True)
+    worker_exit = result.get("worker_exit_code", 0)
+
+    failure_reasons = [r for r in result.get("failure_reasons", []) if "semantic" not in r]
+    failure_reasons.extend(grade_failure_reasons("semantic", semantic))
+
+    result.update(
+        {
+            "status": "graded" if graders_valid else "ungraded",
+            "overall_pass": worker_exit == 0 and protected and graders_pass,
+            "score": headline.get("score") if isinstance(headline, dict) else None,
+            "semantic_score": sem_result.get("score") if isinstance(sem_result, dict) else None,
+            "semantic_pass": sem_result.get("overall_pass") if isinstance(sem_result, dict) else None,
+            "semantic_judges": len(semantic.get("judges", [])),
+            "semantic_status": semantic["status"],
+            "failure_reasons": list(dict.fromkeys(failure_reasons)),
+        }
+    )
+    write_json(run_dir / "result.json", result)
+    return result
