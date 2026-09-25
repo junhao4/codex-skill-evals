@@ -452,7 +452,8 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
                 f"(parallel) ##########",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(pending_semantic)) as executor:
+            max_parallel = min(len(pending_semantic), 8)
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 futures = {
                     executor.submit(
                         regrade_with_semantic,
