@@ -474,7 +474,10 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
 
     commands: list[dict[str, Any]] = []
     input_tokens = 0
+    cached_input_tokens = 0
+    cache_write_input_tokens = 0
     output_tokens = 0
+    reasoning_output_tokens = 0
     for event in events:
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "command_execution":
@@ -484,7 +487,14 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
         ):
             usage = event["usage"]
             input_tokens += int(usage.get("input_tokens", 0) or 0)
+            cached_input_tokens += int(usage.get("cached_input_tokens", 0) or 0)
+            cache_write_input_tokens += int(
+                usage.get("cache_write_input_tokens", 0) or 0
+            )
             output_tokens += int(usage.get("output_tokens", 0) or 0)
+            reasoning_output_tokens += int(
+                usage.get("reasoning_output_tokens", 0) or 0
+            )
 
     command_texts = [str(command.get("command", "")) for command in commands]
     repeated = sum(count - 1 for count in Counter(command_texts).values() if count > 1)
@@ -512,7 +522,12 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
         "prohibited_commands": prohibited,
         "skill_read_observed": skill_read_observed,
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_input_tokens,
+        "uncached_input_tokens": max(input_tokens - cached_input_tokens, 0),
         "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "billed_output_tokens": output_tokens + reasoning_output_tokens,
     }
 
 
@@ -1243,6 +1258,16 @@ def run_trial(
         else None,
         "semantic_judges": len(semantic.get("judges", [])),
         "worker_exit_code": worker_exit_code,
+        "tokens": {
+            "input_tokens": metrics.get("input_tokens", 0),
+            "cached_input_tokens": metrics.get("cached_input_tokens", 0),
+            "cache_write_input_tokens": metrics.get("cache_write_input_tokens", 0),
+            "uncached_input_tokens": metrics.get("uncached_input_tokens", 0),
+            "output_tokens": metrics.get("output_tokens", 0),
+            "reasoning_output_tokens": metrics.get("reasoning_output_tokens", 0),
+            "billed_output_tokens": metrics.get("billed_output_tokens", 0),
+        },
+        "model": model,
         "worker_turns_planned": len(prompts),
         "worker_turns_completed": completed_turns,
         "protected_inputs_intact": final_state["protected_inputs_intact"],

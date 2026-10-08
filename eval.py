@@ -149,30 +149,63 @@ def check_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
 
 def aggregate(results: list[dict]) -> dict:
     """Summarize repeated trials and baseline-versus-skill differences."""
+    TOKEN_FIELDS = (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "uncached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "billed_output_tokens",
+    )
     cells: dict[str, dict[str, dict]] = {}
     for result in results:
         test_case = cells.setdefault(result["test_case"], {})
         cell = test_case.setdefault(
             result["configuration"],
-            {"scores": [], "passed_trials": 0, "total_trials": 0},
+            {"scores": [], "token_samples": [], "passed_trials": 0, "total_trials": 0},
         )
         cell["total_trials"] += 1
         cell["passed_trials"] += int(result["overall_pass"])
         if isinstance(result["score"], (int, float)):
             cell["scores"].append(result["score"])
+        tokens = result.get("tokens")
+        if isinstance(tokens, dict):
+            cell["token_samples"].append(tokens)
 
     comparisons: dict[str, dict] = {}
     for test_case_name, configurations in cells.items():
         for cell in configurations.values():
             scores = cell.pop("scores")
             cell["mean_score"] = round(sum(scores) / len(scores), 2) if scores else None
-        baseline = configurations.get("baseline", {}).get("mean_score")
-        with_skill = configurations.get("with-skill", {}).get("mean_score")
-        if isinstance(baseline, (int, float)) and isinstance(with_skill, (int, float)):
+            samples = cell.pop("token_samples")
+            mean_tokens: dict[str, float] = {}
+            for field in TOKEN_FIELDS:
+                values = [
+                    s.get(field, 0) for s in samples if isinstance(s.get(field, 0), (int, float))
+                ]
+                mean_tokens[field] = round(sum(values) / len(values), 2) if values else 0
+            cell["mean_tokens"] = mean_tokens
+        baseline = configurations.get("baseline", {})
+        with_skill = configurations.get("with-skill", {})
+        baseline_score = baseline.get("mean_score")
+        with_skill_score = with_skill.get("mean_score")
+        if isinstance(baseline_score, (int, float)) and isinstance(
+            with_skill_score, (int, float)
+        ):
+            token_delta = {
+                field: round(
+                    with_skill["mean_tokens"].get(field, 0)
+                    - baseline["mean_tokens"].get(field, 0),
+                    2,
+                )
+                for field in TOKEN_FIELDS
+            }
             comparisons[test_case_name] = {
-                "baseline_mean": baseline,
-                "with_skill_mean": with_skill,
-                "delta": round(with_skill - baseline, 2),
+                "baseline_mean": baseline_score,
+                "with_skill_mean": with_skill_score,
+                "delta": round(with_skill_score - baseline_score, 2),
+                "token_delta": token_delta,
             }
     return {"cells": cells, "comparisons": comparisons}
 
@@ -263,6 +296,49 @@ def write_report(
                 f"| {markdown_cell(name)} | {comparison['baseline_mean']} | "
                 f"{comparison['with_skill_mean']} | {comparison['delta']:+} |"
             )
+
+        has_token_data = any(
+            isinstance(c.get("token_delta"), dict) for c in comparisons.values()
+        )
+        if has_token_data:
+            lines.extend(
+                [
+                    "",
+                    "## Token cost comparison",
+                    "",
+                    "Mean tokens per trial. `billed output` = output + reasoning "
+                    "(reasoning bills as output). `uncached input` = input - cached. "
+                    "A negative delta means with-skill used fewer tokens. Token counts "
+                    "are only comparable across runs on the same model.",
+                    "",
+                    "| Test case | Config | Uncached input | Cached input | "
+                    "Output | Reasoning | Billed output |",
+                    "|---|---|---:|---:|---:|---:|---:|",
+                ]
+            )
+            cells = aggregates.get("cells", {})
+            for name in comparisons:
+                for config in ("baseline", "with-skill"):
+                    mt = cells.get(name, {}).get(config, {}).get("mean_tokens")
+                    if not isinstance(mt, dict):
+                        continue
+                    lines.append(
+                        f"| {markdown_cell(name)} | {config} | "
+                        f"{mt.get('uncached_input_tokens', 0)} | "
+                        f"{mt.get('cached_input_tokens', 0)} | "
+                        f"{mt.get('output_tokens', 0)} | "
+                        f"{mt.get('reasoning_output_tokens', 0)} | "
+                        f"{mt.get('billed_output_tokens', 0)} |"
+                    )
+                td = comparisons[name].get("token_delta", {})
+                lines.append(
+                    f"| {markdown_cell(name)} | **delta** | "
+                    f"{td.get('uncached_input_tokens', 0):+} | "
+                    f"{td.get('cached_input_tokens', 0):+} | "
+                    f"{td.get('output_tokens', 0):+} | "
+                    f"{td.get('reasoning_output_tokens', 0):+} | "
+                    f"{td.get('billed_output_tokens', 0):+} |"
+                )
 
     failed = [result for result in results if not result["overall_pass"]]
     if failed or experiment.get("error"):
