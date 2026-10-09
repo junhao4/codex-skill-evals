@@ -88,3 +88,60 @@ def test_report_renders_tokens_without_compare(tmp_path):
     assert "70" in text
     # No baseline, so no delta row
     assert "**delta**" not in text
+
+
+def test_report_renders_provenance_header(tmp_path):
+    """The report states the model + reasoning effort that produced the numbers."""
+    results = [
+        {
+            "test_case": "case-a", "configuration": "with-skill", "trial": 1,
+            "score": 90, "overall_pass": True, "run_directory": "trials/x",
+            "resolved_model": "gpt-5.6-luna", "resolved_reasoning_effort": "low",
+            "tokens": {
+                "input_tokens": 100, "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0, "uncached_input_tokens": 100,
+                "output_tokens": 10, "reasoning_output_tokens": 0,
+                "billed_output_tokens": 10,
+            },
+        },
+    ]
+    aggregates = eval_mod.aggregate(results)
+    experiment = {
+        "skill": "demo", "status": "completed", "overall_pass": True,
+        "mean_score": 90, "passed_trials": 1, "worker_trials": 1,
+        "semantic_judges": 0, "trials": 1, "started_at": "2026-10-09T00:00:00Z",
+    }
+
+    report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
+    text = report_path.read_text(encoding="utf-8")
+
+    assert "gpt-5.6-luna" in text
+    assert "low" in text  # reasoning effort
+    # provenance should be labelled so a reader understands it
+    assert "Model" in text and "Reasoning" in text
+
+
+def test_report_marks_provenance_unknown_when_absent(tmp_path):
+    """If model/effort could not be captured, say so rather than omit silently."""
+    results = [
+        {
+            "test_case": "case-a", "configuration": "with-skill", "trial": 1,
+            "score": 90, "overall_pass": True, "run_directory": "trials/x",
+            "resolved_model": None, "resolved_reasoning_effort": None,
+            "tokens": {
+                "input_tokens": 100, "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0, "uncached_input_tokens": 100,
+                "output_tokens": 10, "reasoning_output_tokens": 0,
+                "billed_output_tokens": 10,
+            },
+        },
+    ]
+    aggregates = eval_mod.aggregate(results)
+    experiment = {
+        "skill": "demo", "status": "completed", "overall_pass": True,
+        "mean_score": 90, "passed_trials": 1, "worker_trials": 1,
+        "semantic_judges": 0, "trials": 1, "started_at": "2026-10-09T00:00:00Z",
+    }
+    report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
+    text = report_path.read_text(encoding="utf-8")
+    assert "not captured" in text.lower() or "unknown" in text.lower()

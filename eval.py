@@ -229,6 +229,21 @@ def write_report(
     score = experiment.get("mean_score")
     score_text = f"{score}/100" if isinstance(score, (int, float)) else "Not available"
 
+    # Provenance: the model + reasoning effort that actually produced these
+    # numbers, read back from the rollout. Distinct resolved values across trials
+    # are joined; absence is marked explicitly rather than omitted.
+    def _distinct(key: str) -> str:
+        vals = sorted({
+            str(r.get(key)) for r in results
+            if r.get(key) not in (None, "")
+        })
+        return ", ".join(vals) if vals else "not captured"
+
+    model_text = _distinct("resolved_model")
+    reasoning_text = _distinct("resolved_reasoning_effort")
+    trials_text = str(experiment.get("trials", len(results)))
+    date_text = experiment.get("started_at", "unknown")
+
     lines = [
         f"# Evaluation report: {experiment['skill']}",
         "",
@@ -242,6 +257,13 @@ def write_report(
         f"| Completed trials | {len(results)}/{experiment['worker_trials']} |",
         f"| Experiment status | {experiment['status']} |",
         f"| Semantic judges | {experiment.get('semantic_judges', 0)} per eligible trial |",
+        f"| Model | {markdown_cell(model_text)} |",
+        f"| Reasoning effort | {markdown_cell(reasoning_text)} |",
+        f"| Trials per cell | {markdown_cell(trials_text)} |",
+        f"| Started | {markdown_cell(date_text)} |",
+        "",
+        "Token counts below are only comparable across runs on the same model "
+        "and reasoning effort.",
         "",
         "## Trial results",
         "",

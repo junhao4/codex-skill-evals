@@ -145,6 +145,52 @@ def trace_thread_id(trace: Path) -> str | None:
     return None
 
 
+def read_turn_context(rollout: Path) -> dict[str, str | None]:
+    """Extract the model and reasoning effort from a persisted Codex rollout.
+
+    Pure (reads one file, no network/subprocess). Codex records these in
+    `turn_context` records as `payload.model` and `payload.effort`. A multi-turn
+    session has several; the LAST one reflects the final turn's settings. Returns
+    `{"model": None, "reasoning_effort": None}` when the file is absent or has no
+    `turn_context` record, so callers never crash on an ephemeral/missing rollout.
+    """
+    model: str | None = None
+    effort: str | None = None
+    if not rollout.is_file():
+        return {"model": None, "reasoning_effort": None}
+    for line in rollout.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "turn_context":
+            continue
+        payload = event.get("payload", event)
+        if not isinstance(payload, dict):
+            continue
+        if isinstance(payload.get("model"), str):
+            model = payload["model"]
+        if isinstance(payload.get("effort"), str):
+            effort = payload["effort"]
+    return {"model": model, "reasoning_effort": effort}
+
+
+def find_rollout(thread_id: str | None, sessions_root: Path) -> Path | None:
+    """Locate the persisted rollout file for a thread id. READ-ONLY.
+
+    Codex names rollouts `rollout-<timestamp>-<thread-id>.jsonl` under a
+    date-nested tree. This only READS the sessions directory to find a match; it
+    never writes, moves, or deletes anything there. Returns None when the thread
+    id is unknown, the directory is absent, or no file matches.
+    """
+    if not thread_id or not sessions_root.is_dir():
+        return None
+    matches = sorted(sessions_root.rglob(f"rollout-*{thread_id}*.jsonl"))
+    return matches[0] if matches else None
+
+
 def concatenate_files(sources: list[Path], destination: Path) -> None:
     """Combine text evidence files while preserving valid line boundaries."""
     with destination.open("w", encoding="utf-8") as output:
@@ -1093,8 +1139,10 @@ def run_trial(
 
         if index == 1:
             worker_command = ["codex", "exec"]
-            if not case.interactions:
-                worker_command.append("--ephemeral")
+            # NOTE: previously single-turn cases used --ephemeral. We now always
+            # persist the rollout so provenance (model + reasoning effort) can be
+            # read back from turn_context. The harness only READS the rollout; it
+            # never deletes from ~/.codex/sessions/.
             worker_command.extend(
                 [
                     "--json",
@@ -1145,7 +1193,7 @@ def run_trial(
                 "completed_at": now(),
             },
         )
-        if index == 1 and case.interactions:
+        if index == 1:
             thread_id = trace_thread_id(turn_trace)
         if worker.returncode != 0:
             break
@@ -1154,6 +1202,14 @@ def run_trial(
     concatenate_files(trace_parts, worker_dir / "trace.jsonl")
     metadata["worker_turns_completed"] = completed_turns
     metadata["thread_id"] = thread_id
+    # Read-only provenance: locate this trial's rollout by thread id and read the
+    # model + reasoning effort that ACTUALLY ran. Never writes/deletes sessions.
+    provenance = read_turn_context(
+        find_rollout(thread_id, Path.home() / ".codex" / "sessions")
+        or Path("/nonexistent")
+    )
+    metadata["resolved_model"] = provenance["model"]
+    metadata["resolved_reasoning_effort"] = provenance["reasoning_effort"]
     write_json(run_dir / "run.json", metadata)
 
     print("  [4/7] Capturing trace, metrics, Git state, and diff", flush=True)
@@ -1299,6 +1355,8 @@ def run_trial(
             "billed_output_tokens": metrics.get("billed_output_tokens", 0),
         },
         "model": model,
+        "resolved_model": metadata.get("resolved_model"),
+        "resolved_reasoning_effort": metadata.get("resolved_reasoning_effort"),
         "worker_turns_planned": len(prompts),
         "worker_turns_completed": completed_turns,
         "protected_inputs_intact": final_state["protected_inputs_intact"],
