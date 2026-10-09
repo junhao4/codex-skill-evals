@@ -937,6 +937,56 @@ def grade_failure_reasons(label: str, grade: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def classify_invocation(
+    has_skill: bool, prompt_texts: list[str], skill_name: str
+) -> str:
+    """Classify how the target skill was invoked, from the worker prompts.
+
+    Pure (no I/O). Returns one of: "no-skill-baseline" (skill not injected),
+    "explicit" (a prompt names the skill as `$name` or `/name`), or
+    "implicit-candidate" (skill present but not named in any prompt).
+    """
+    if not has_skill:
+        return "no-skill-baseline"
+    explicit_names = (f"${skill_name}", f"/{skill_name}")
+    explicitly_named = any(
+        name in prompt for prompt in prompt_texts for name in explicit_names
+    )
+    return "explicit" if explicitly_named else "implicit-candidate"
+
+
+def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
+    """Combine deterministic and semantic grades into the trial verdict.
+
+    Pure (no I/O). A grade dict has `status` and `result`. Only grades whose
+    status is not "not_requested" count. `graders_valid` requires at least one
+    requested grade and all requested grades "completed"; `graders_pass`
+    additionally requires every requested result's `overall_pass`. The headline
+    prefers the semantic result when present, else the deterministic result.
+    """
+    requested_grades = [
+        grade
+        for grade in (deterministic, semantic)
+        if grade["status"] != "not_requested"
+    ]
+    graders_valid = bool(requested_grades) and all(
+        grade["status"] == "completed" for grade in requested_grades
+    )
+    graders_pass = graders_valid and all(
+        bool(grade["result"].get("overall_pass")) for grade in requested_grades
+    )
+    deterministic_result = deterministic.get("result")
+    semantic_result = semantic.get("result")
+    headline = (
+        semantic_result if isinstance(semantic_result, dict) else deterministic_result
+    )
+    return {
+        "graders_valid": graders_valid,
+        "graders_pass": graders_pass,
+        "headline": headline,
+    }
+
+
 def run_trial(
     *,
     case: Case,
@@ -1018,16 +1068,7 @@ def run_trial(
     )
     prompts = [case.prompt, *case.interactions]
     prompt_texts = [prompt.read_text(encoding="utf-8") for prompt in prompts]
-    explicit_names = (f"${skill_root.name}", f"/{skill_root.name}")
-    explicitly_named = any(
-        name in prompt for prompt in prompt_texts for name in explicit_names
-    )
-    if has_skill and explicitly_named:
-        invocation = "explicit"
-    elif has_skill:
-        invocation = "implicit-candidate"
-    else:
-        invocation = "no-skill-baseline"
+    invocation = classify_invocation(has_skill, prompt_texts, skill_root.name)
     metadata["skill_invocation"] = invocation
     metadata["worker_prompt_sha256"] = hashlib.sha256(
         prompt_texts[0].encode("utf-8")
@@ -1202,20 +1243,10 @@ def run_trial(
     print("  [7/7] Finalizing artifacts and writing the result", flush=True)
     deterministic_result = deterministic.get("result")
     semantic_result = semantic.get("result")
-    requested_grades = [
-        grade
-        for grade in (deterministic, semantic)
-        if grade["status"] != "not_requested"
-    ]
-    graders_valid = bool(requested_grades) and all(
-        grade["status"] == "completed" for grade in requested_grades
-    )
-    graders_pass = graders_valid and all(
-        bool(grade["result"].get("overall_pass")) for grade in requested_grades
-    )
-    headline = (
-        semantic_result if isinstance(semantic_result, dict) else deterministic_result
-    )
+    outcome = grade_outcome(deterministic, semantic)
+    graders_valid = outcome["graders_valid"]
+    graders_pass = outcome["graders_pass"]
+    headline = outcome["headline"]
     failure_reasons: list[str] = []
     if worker_exit_code != 0:
         failure_reasons.append(f"Worker exited with code {worker_exit_code}.")
@@ -1301,14 +1332,12 @@ def regrade_with_semantic(
         "errors": [],
     }
 
-    requested = [g for g in (deterministic, semantic) if g["status"] != "not_requested"]
-    graders_valid = bool(requested) and all(g["status"] == "completed" for g in requested)
-    graders_pass = graders_valid and all(
-        bool(g["result"].get("overall_pass")) for g in requested
-    )
+    outcome = grade_outcome(deterministic, semantic)
+    graders_valid = outcome["graders_valid"]
+    graders_pass = outcome["graders_pass"]
     det_result = deterministic.get("result")
     sem_result = semantic.get("result")
-    headline = sem_result if isinstance(sem_result, dict) else det_result
+    headline = outcome["headline"]
     protected = result.get("protected_inputs_intact", True)
     worker_exit = result.get("worker_exit_code", 0)
 
