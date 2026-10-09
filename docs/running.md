@@ -122,3 +122,29 @@ Use an implicit prompt for a normal baseline comparison. If the prompt
 explicitly requests `$<skill-name>`, the baseline instead tests what happens
 when a requested skill is unavailable.
 
+### Token usage
+
+Every run that produces results includes a token usage section in the report,
+alongside the score — it is a measurement, not a comparison-only feature. It
+shows the mean tokens per trial for each configuration, broken into four
+categories:
+
+| Column | Meaning |
+|---|---|
+| Uncached input | `input − cached` input tokens (billed at the full rate) |
+| Cached input | Input tokens served from cache (billed at a discount) |
+| Output | Visible output tokens |
+| Reasoning | Reasoning tokens — these bill as output |
+| Billed output | `output + reasoning`, the figure that drives output cost |
+
+With `--compare`, an extra **delta** row per test case shows with-skill minus
+baseline for each column; a negative delta means the with-skill run used fewer
+tokens. Read tokens together with the score: a skill is only more efficient if
+it achieves an equal-or-better score for fewer output and reasoning tokens.
+
+Token counts are only comparable across runs on the **same model and reasoning
+effort** — different models or reasoning levels produce different counts for the
+same task. The harness currently uses whatever model and reasoning effort your
+Codex configuration provides; it does not yet pin or record them in the report,
+so ensure both are held constant when comparing runs.
+

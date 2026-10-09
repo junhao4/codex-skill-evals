@@ -29,7 +29,7 @@ Report: .../.agents/evals/<skill-name>/runs/experiment-NNN/report.md
 
 | Output | When written | Meaning |
 |---|---|---|
-| `report.md` | Updated when the experiment completes, fails, or is interrupted | Human-readable outcome, mean score, trial table, baseline comparison, and main failure reasons |
+| `report.md` | Updated when the experiment completes, fails, or is interrupted | Human-readable outcome, mean score, trial table, baseline comparison, token usage, and main failure reasons |
 | `experiment.json` | Created before the first trial and finalized when the experiment stops | Complete machine-readable manifest, status, aggregate results, and all trial summaries |
 
 Open `experiment.json` only when a script needs the data or when you need more
@@ -40,7 +40,7 @@ Each trial directory contains:
 
 | Output | Meaning |
 |---|---|
-| `result.json` | Final trial result and separate grader scores |
+| `result.json` | Final trial result, separate grader scores, model, and a `tokens` breakdown (uncached/cached input, output, reasoning, billed output) |
 | `run.json` | Trial inputs, configuration, initial Git state, invocation mode, and turn metadata |
 | `workspace/` | Final file snapshot left by the worker; its temporary `.git/` is removed after the graders finish |
 | `worker/result.json` | Worker exit status, metrics, final Git state, protected-input checks, and untracked paths |
