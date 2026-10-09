@@ -51,10 +51,40 @@ def test_report_renders_token_section(tmp_path):
     report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
     text = report_path.read_text(encoding="utf-8")
 
-    assert "## Token cost comparison" in text
+    assert "## Token usage" in text
     assert "Billed output" in text
     # delta row shows with-skill used 40 fewer billed-output tokens
     assert "-40" in text
     # both config rows present
     assert "| case-a | baseline |" in text
     assert "| case-a | with-skill |" in text
+
+
+def test_report_renders_tokens_without_compare(tmp_path):
+    """Tokens are a measurement like the score: shown even for a single-config
+    run (no --compare), just without a delta row."""
+    results = [
+        _result("case-a", "with-skill", 90, 60),
+        _result("case-a", "with-skill", 90, 80),
+    ]
+    aggregates = eval_mod.aggregate(results)
+    experiment = {
+        "skill": "demo",
+        "status": "completed",
+        "overall_pass": True,
+        "mean_score": 90,
+        "passed_trials": 2,
+        "worker_trials": 2,
+        "semantic_judges": 0,
+    }
+
+    report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
+    text = report_path.read_text(encoding="utf-8")
+
+    # Token section and the with-skill mean row must appear
+    assert "## Token" in text
+    assert "| case-a | with-skill |" in text
+    # mean billed output = (60 + 80) / 2 = 70
+    assert "70" in text
+    # No baseline, so no delta row
+    assert "**delta**" not in text

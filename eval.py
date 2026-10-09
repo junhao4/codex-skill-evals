@@ -297,40 +297,44 @@ def write_report(
                 f"{comparison['with_skill_mean']} | {comparison['delta']:+} |"
             )
 
-        has_token_data = any(
-            isinstance(c.get("token_delta"), dict) for c in comparisons.values()
+    cells = aggregates.get("cells", {})
+    has_token_data = any(
+        isinstance(cell.get("mean_tokens"), dict)
+        for configs in cells.values()
+        for cell in configs.values()
+    )
+    if has_token_data:
+        lines.extend(
+            [
+                "",
+                "## Token usage",
+                "",
+                "Mean tokens per trial. `billed output` = output + reasoning "
+                "(reasoning bills as output). `uncached input` = input - cached. "
+                "Where a baseline is compared, a negative delta means with-skill "
+                "used fewer tokens. Token counts are only comparable across runs "
+                "on the same model and reasoning effort.",
+                "",
+                "| Test case | Config | Uncached input | Cached input | "
+                "Output | Reasoning | Billed output |",
+                "|---|---|---:|---:|---:|---:|---:|",
+            ]
         )
-        if has_token_data:
-            lines.extend(
-                [
-                    "",
-                    "## Token cost comparison",
-                    "",
-                    "Mean tokens per trial. `billed output` = output + reasoning "
-                    "(reasoning bills as output). `uncached input` = input - cached. "
-                    "A negative delta means with-skill used fewer tokens. Token counts "
-                    "are only comparable across runs on the same model.",
-                    "",
-                    "| Test case | Config | Uncached input | Cached input | "
-                    "Output | Reasoning | Billed output |",
-                    "|---|---|---:|---:|---:|---:|---:|",
-                ]
-            )
-            cells = aggregates.get("cells", {})
-            for name in comparisons:
-                for config in ("baseline", "with-skill"):
-                    mt = cells.get(name, {}).get(config, {}).get("mean_tokens")
-                    if not isinstance(mt, dict):
-                        continue
-                    lines.append(
-                        f"| {markdown_cell(name)} | {config} | "
-                        f"{mt.get('uncached_input_tokens', 0)} | "
-                        f"{mt.get('cached_input_tokens', 0)} | "
-                        f"{mt.get('output_tokens', 0)} | "
-                        f"{mt.get('reasoning_output_tokens', 0)} | "
-                        f"{mt.get('billed_output_tokens', 0)} |"
-                    )
-                td = comparisons[name].get("token_delta", {})
+        for name in sorted(cells):
+            for config in ("baseline", "with-skill"):
+                mt = cells.get(name, {}).get(config, {}).get("mean_tokens")
+                if not isinstance(mt, dict):
+                    continue
+                lines.append(
+                    f"| {markdown_cell(name)} | {config} | "
+                    f"{mt.get('uncached_input_tokens', 0)} | "
+                    f"{mt.get('cached_input_tokens', 0)} | "
+                    f"{mt.get('output_tokens', 0)} | "
+                    f"{mt.get('reasoning_output_tokens', 0)} | "
+                    f"{mt.get('billed_output_tokens', 0)} |"
+                )
+            td = comparisons.get(name, {}).get("token_delta")
+            if isinstance(td, dict):
                 lines.append(
                     f"| {markdown_cell(name)} | **delta** | "
                     f"{td.get('uncached_input_tokens', 0):+} | "
