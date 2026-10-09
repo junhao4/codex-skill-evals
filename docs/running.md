@@ -144,7 +144,9 @@ it achieves an equal-or-better score for fewer output and reasoning tokens.
 
 Token counts are only comparable across runs on the **same model and reasoning
 effort** — different models or reasoning levels produce different counts for the
-same task. The harness currently uses whatever model and reasoning effort your
-Codex configuration provides; it does not yet pin or record them in the report,
-so ensure both are held constant when comparing runs.
+same task. The report's Result section records the model and reasoning effort
+that actually produced the run (read back from the Codex rollout), so you can
+confirm two runs are comparable. The harness uses whatever model and reasoning
+effort your Codex configuration provides; hold both constant when comparing
+runs, and check the recorded values match.
 
