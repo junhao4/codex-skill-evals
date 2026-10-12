@@ -39,6 +39,133 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+# --- API-equivalent cost estimation (Layer 1c) --------------------------------
+#
+# IMPORTANT HONESTY NOTE. These rates are PUBLIC OpenAI *API* list prices. Many
+# users (including ChatGPT Plus / Edu / Enterprise subscription or credit-pool
+# accounts) are NOT billed per token at these rates at all. For those users this
+# figure is a HYPOTHETICAL "what an API user would pay" number — useful only as a
+# model-agnostic unit for comparing one run against another. It is NEVER the
+# user's actual subscription or credit spend. Every surface that prints it MUST
+# carry that caveat. This mirrors how Langfuse/Braintrust label cost as an
+# *estimate* derived from a price table times token usage.
+#
+# Keep this table pinned and dated. Rates are USD per 1,000,000 tokens, from the
+# STANDARD processing tier of platform.openai.com/pricing. Each model carries
+# BOTH context tiers the card lists: "short" and "long". A request is billed at
+# the long-context rate once its input context crosses LONG_CONTEXT_THRESHOLD
+# tokens, and crossing re-prices the WHOLE request (a cliff, not a marginal
+# rate) — per OpenAI's note that standard rates apply "for context lengths under
+# 272K". (The card also lists Batch/Flex/Fast processing tiers, not encoded.)
+# Update PRICING_AS_OF when you refresh the numbers.
+PRICING_AS_OF = "2026-10-12"
+PRICING_SOURCE = (
+    "platform.openai.com/pricing (API list prices, Standard tier, "
+    "short+long context)"
+)
+# Input context size (uncached + cached) at/above which the long-context rate
+# applies to the whole request. OpenAI states standard rates apply under ~272K.
+LONG_CONTEXT_THRESHOLD = 272_000
+# model id -> {"short"/"long": (input, cached, cache_write, output)} per 1M.
+# reasoning tokens bill as output, so billed_output uses the output rate.
+# cache_write None means the card lists no separate cache-write rate. A model
+# may omit a tier (e.g. its long-context column was not published/legible); the
+# estimator falls back to the tier that exists.
+PRICING: dict[str, dict[str, tuple[float, float | None, float | None, float]]] = {
+    "gpt-6-astra": {
+        "short": (10.00, 1.00, 12.50, 50.00),
+        "long": (20.00, 2.00, 25.00, 75.00),
+    },
+    "gpt-6.1-sol": {
+        "short": (2.00, 0.10, 2.50, 10.00),
+        "long": (4.00, 0.20, 5.00, 15.00),
+    },
+    "gpt-6-luna": {
+        "short": (0.10, 0.01, 0.125, 0.50),
+        "long": (0.20, 0.02, 0.25, 0.75),
+    },
+    "gpt-6-sol": {
+        "short": (2.00, 0.20, 2.50, 10.00),
+        "long": (4.00, 0.40, 5.00, 15.00),
+    },
+    "gpt-5.6-sol": {
+        "short": (4.00, 0.40, 5.00, 20.00),
+        "long": (8.00, 0.80, 10.00, 30.00),
+    },
+    "gpt-5.6-terra": {
+        "short": (2.00, 0.20, 2.50, 12.00),
+        "long": (4.00, 0.40, 5.00, 18.00),
+    },
+    "gpt-5.6-luna": {
+        "short": (0.20, 0.02, 0.25, 1.20),
+        "long": (0.40, 0.04, 0.50, 1.80),
+    },
+    "gpt-5.5": {
+        "short": (5.00, 0.50, None, 30.00),
+        "long": (10.00, 1.00, None, 45.00),
+    },
+    "gpt-5.5-pro": {
+        "short": (30.00, None, None, 180.00),
+        "long": (60.00, None, None, 270.00),
+    },
+    # gpt-5.4 long-context column was not fully legible on the source; short only.
+    "gpt-5.4": {
+        "short": (2.50, 0.25, None, 15.00),
+    },
+}
+
+
+def _select_tier(model_rates: dict, input_context: float) -> tuple:
+    """Pick the (input, cached, cache_write, output) tuple for a request's input
+    context size. Uses long-context rates at/above the threshold; falls back to
+    whichever tier exists when a model omits one."""
+    want = "long" if input_context >= LONG_CONTEXT_THRESHOLD else "short"
+    if want in model_rates:
+        return model_rates[want]
+    # Fall back to the only tier published for this model.
+    other = "short" if want == "long" else "long"
+    return model_rates[other]
+
+
+def estimate_api_cost(mean_tokens: dict, model: str | None) -> float | None:
+    """Pure: estimate API-equivalent USD cost for one trial's mean token usage.
+
+    Returns None when the model is unknown or not supplied (never guess). Picks
+    the short- or long-context rate tier from the request's input context size
+    (uncached + cached), then prices uncached-input at the input rate,
+    cached-input at the cached rate, cache-write input at the cache-write rate
+    (when the card lists one), and billed-output (output + reasoning) at the
+    output rate.
+    """
+    if not model:
+        return None
+    model_rates = PRICING.get(model)
+    if model_rates is None:
+        return None
+    uncached = mean_tokens.get("uncached_input_tokens", 0) or 0
+    cached = mean_tokens.get("cached_input_tokens", 0) or 0
+    cache_write = mean_tokens.get("cache_write_input_tokens", 0) or 0
+    billed_out = mean_tokens.get("billed_output_tokens", 0) or 0
+    input_context = uncached + cached
+    input_rate, cached_rate, cache_write_rate, output_rate = _select_tier(
+        model_rates, input_context
+    )
+    cost = (
+        uncached * input_rate
+        + cached * (cached_rate or 0)
+        + cache_write * (cache_write_rate or 0)
+        + billed_out * output_rate
+    ) / 1_000_000
+    return round(cost, 6)
+
+
+def format_cost(cost: float | None) -> str:
+    """Render a cost estimate, or a clear 'n/a' when the model is unpriced."""
+    if cost is None:
+        return "n/a (model not in price table)"
+    return f"${cost:.4f}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -385,23 +512,36 @@ def write_report(
                 "used fewer tokens. Token counts are only comparable across runs "
                 "on the same model and reasoning effort.",
                 "",
+                f"The `est. cost` column is an **API-equivalent estimate only** "
+                f"(public API list prices as of {PRICING_AS_OF}, "
+                f"{PRICING_SOURCE}) — it is NOT your actual subscription or "
+                f"credit spend; it is a model-agnostic unit for comparing runs. "
+                f"The short- vs long-context rate is auto-selected per trial at "
+                f"{LONG_CONTEXT_THRESHOLD:,} input tokens. `n/a` means the model "
+                f"is not in the price table.",
+                "",
                 "| Test case | Config | Uncached input | Cached input | "
-                "Output | Reasoning | Billed output |",
-                "|---|---|---:|---:|---:|---:|---:|",
+                "Output | Reasoning | Billed output | Est. cost |",
+                "|---|---|---:|---:|---:|---:|---:|---:|",
             ]
         )
+        # Only cost when exactly one priced model produced the run; otherwise the
+        # dollar figure would mix rate cards. _distinct joins multiple models.
+        cost_model = model_text if model_text in PRICING else None
         for name in sorted(cells):
             for config in ("baseline", "with-skill"):
                 mt = cells.get(name, {}).get(config, {}).get("mean_tokens")
                 if not isinstance(mt, dict):
                     continue
+                cost = estimate_api_cost(mt, cost_model)
                 lines.append(
                     f"| {markdown_cell(name)} | {config} | "
                     f"{mt.get('uncached_input_tokens', 0)} | "
                     f"{mt.get('cached_input_tokens', 0)} | "
                     f"{mt.get('output_tokens', 0)} | "
                     f"{mt.get('reasoning_output_tokens', 0)} | "
-                    f"{mt.get('billed_output_tokens', 0)} |"
+                    f"{mt.get('billed_output_tokens', 0)} | "
+                    f"{format_cost(cost)} |"
                 )
             td = comparisons.get(name, {}).get("token_delta")
             if isinstance(td, dict):
@@ -417,7 +557,13 @@ def write_report(
                 cell_text = " | ".join(
                     format_delta(base_mt.get(f, 0), skill_mt.get(f, 0)) for f in fields
                 )
-                lines.append(f"| {markdown_cell(name)} | **delta** | {cell_text} |")
+                cost_delta = format_delta(
+                    estimate_api_cost(base_mt, cost_model),
+                    estimate_api_cost(skill_mt, cost_model),
+                )
+                lines.append(
+                    f"| {markdown_cell(name)} | **delta** | {cell_text} | {cost_delta} |"
+                )
 
     failed = [
         result
@@ -752,6 +898,10 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
             "new": new_value,
             "verdict": _axis_verdict(old_value, new_value, higher_is_better=False),
         }
+    # Carry the raw mean-token dicts so a caller that knows the model can derive
+    # an API-equivalent cost estimate without recomputing per-axis values.
+    result["_mean_tokens_old"] = old_tokens
+    result["_mean_tokens_new"] = new_tokens
     return result
 
 
@@ -860,6 +1010,13 @@ def render_comparison_markdown(
         "win). Token counts are only comparable across runs on the SAME model and "
         "reasoning effort — see the setup row below.",
         "",
+        f"The `est. API-equiv. cost` row is an **estimate at public API list "
+        f"prices** (as of {PRICING_AS_OF}, {PRICING_SOURCE}) — NOT actual "
+        f"subscription or credit spend, and shown only when both experiments ran "
+        f"on the same priced model. The short-/long-context rate is auto-selected "
+        f"per cell at {LONG_CONTEXT_THRESHOLD:,} input tokens. It is a "
+        f"model-agnostic unit for comparing v1 against v2.",
+        "",
         "| Setup | v1 (" + old_id + ") | v2 (" + new_id + ") |",
         "|---|---|---|",
         f"| Model | {old_model} | {new_model} |",
@@ -919,6 +1076,25 @@ def render_comparison_markdown(
                 f"| {label} | {_fmt(a['old'])} | {_fmt(a['new'])} | "
                 f"{format_delta(a['old'], a['new'])} | {a['verdict']} |"
             )
+        # API-equivalent cost row: only when BOTH experiments ran on the same
+        # priced model (otherwise the figure would mix rate cards or be a guess).
+        cost_model = (
+            provenance.get("old_model")
+            if provenance.get("old_model") == provenance.get("new_model")
+            and provenance.get("old_model") in PRICING
+            else None
+        )
+        cost_old = estimate_api_cost(diff.get("_mean_tokens_old", {}), cost_model)
+        cost_new = estimate_api_cost(diff.get("_mean_tokens_new", {}), cost_model)
+        if cost_old is not None and cost_new is not None:
+            cost_verdict = _axis_verdict(cost_old, cost_new, higher_is_better=False)
+        else:
+            cost_verdict = "n/a"
+        lines.append(
+            f"| est. API-equiv. cost | {format_cost(cost_old)} | "
+            f"{format_cost(cost_new)} | {format_delta(cost_old, cost_new)} | "
+            f"{cost_verdict} |"
+        )
         lines.append("")
         if row["confounds"]:
             lines.append(
