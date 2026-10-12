@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -24,6 +25,8 @@ from harness import (  # noqa: E402
     discover_skills,
     next_experiment_id,
     now,
+    read_json,
+    read_skill_snapshot_text,
     regrade_with_semantic,
     run_trial,
     validate_grade_schema,
@@ -82,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run all workers first, then batch semantic judges in parallel",
     )
+
+    compare_parser = commands.add_parser(
+        "compare",
+        help="compare two experiments of a skill (v1 vs v2); read-only",
+    )
+    compare_parser.add_argument("skill", help="skill directory name")
+    compare_parser.add_argument("old", help="older experiment id, e.g. experiment-001")
+    compare_parser.add_argument("new", help="newer experiment id, e.g. experiment-002")
     return parser.parse_args()
 
 
@@ -647,6 +658,210 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     return 0
 
 
+# --- Layer 2b: cross-experiment version/regression comparator (read-only) ---
+
+
+def _axis_verdict(old, new, higher_is_better: bool) -> str:
+    """Classify a numeric change as improved / regressed / unchanged. Pure."""
+    if old is None or new is None:
+        return "unknown"
+    if new == old:
+        return "unchanged"
+    better = new > old if higher_is_better else new < old
+    return "improved" if better else "regressed"
+
+
+def _case_representative(experiment: dict, test_case: str, configuration: str) -> dict:
+    """Return one per-trial result for a case/config, for reading run.json. Pure."""
+    for result in experiment.get("results", []):
+        if (
+            result.get("test_case") == test_case
+            and result.get("configuration") == configuration
+        ):
+            return result
+    return {}
+
+
+def compare_cell(old_cell: dict, new_cell: dict) -> dict:
+    """Diff two with-skill cells (score, pass rate, output+reasoning tokens). Pure."""
+    old_score = old_cell.get("mean_score")
+    new_score = new_cell.get("mean_score")
+
+    def _pass_rate(cell: dict):
+        total = cell.get("total_trials") or 0
+        return (cell.get("passed_trials", 0) / total) if total else None
+
+    old_pass = _pass_rate(old_cell)
+    new_pass = _pass_rate(new_cell)
+
+    def _billed(cell: dict):
+        tokens = cell.get("mean_tokens") or {}
+        out = tokens.get("output_tokens", 0) or 0
+        reasoning = tokens.get("reasoning_output_tokens", 0) or 0
+        return out + reasoning
+
+    old_tokens = _billed(old_cell)
+    new_tokens = _billed(new_cell)
+    return {
+        "score": {
+            "old": old_score,
+            "new": new_score,
+            "verdict": _axis_verdict(old_score, new_score, higher_is_better=True),
+        },
+        "pass_rate": {
+            "old": old_pass,
+            "new": new_pass,
+            "verdict": _axis_verdict(old_pass, new_pass, higher_is_better=True),
+        },
+        # Fewer output+reasoning tokens for equal-or-better score is the
+        # optimisation win, so lower is better on this axis.
+        "billed_output_tokens": {
+            "old": old_tokens,
+            "new": new_tokens,
+            "verdict": _axis_verdict(old_tokens, new_tokens, higher_is_better=False),
+        },
+    }
+
+
+def partition_cases(old_cases: list[str], new_cases: list[str]) -> dict:
+    """Split case names into both / only-old / only-new. Pure."""
+    old_set, new_set = set(old_cases), set(new_cases)
+    return {
+        "both": sorted(old_set & new_set),
+        "only_old": sorted(old_set - new_set),
+        "only_new": sorted(new_set - old_set),
+    }
+
+
+def _cell(experiment: dict, test_case: str, configuration: str) -> dict:
+    return (
+        experiment.get("aggregates", {})
+        .get("cells", {})
+        .get(test_case, {})
+        .get(configuration, {})
+    )
+
+
+def _confounds(old_rep: dict, new_rep: dict) -> list[str]:
+    """Detect model/fixture confounds for one case by reading its run.json."""
+    warnings: list[str] = []
+    old_model = old_rep.get("resolved_model")
+    new_model = new_rep.get("resolved_model")
+    if old_model and new_model and old_model != new_model:
+        warnings.append(f"model changed ({old_model} -> {new_model})")
+    old_fixture = _run_field(old_rep, "fixture_sha256")
+    new_fixture = _run_field(new_rep, "fixture_sha256")
+    if old_fixture and new_fixture and old_fixture != new_fixture:
+        warnings.append("fixture changed")
+    return warnings
+
+
+def _run_field(result: dict, field: str):
+    """Read a field from a trial's run.json via its run_directory. READ-ONLY."""
+    run_directory = result.get("run_directory")
+    if not run_directory:
+        return None
+    metadata = read_json(Path(run_directory) / "run.json") or {}
+    return metadata.get(field)
+
+
+def _skill_diff(old_rep: dict, new_rep: dict) -> list[str]:
+    """Unified diff of the two experiments' captured SKILL.md snapshots."""
+    old_dir = old_rep.get("run_directory")
+    new_dir = new_rep.get("run_directory")
+    if not old_dir or not new_dir:
+        return []
+    old_meta = read_json(Path(old_dir) / "run.json") or {}
+    new_meta = read_json(Path(new_dir) / "run.json") or {}
+    old_text = read_skill_snapshot_text(Path(old_dir), old_meta)
+    new_text = read_skill_snapshot_text(Path(new_dir), new_meta)
+    if old_text is None or new_text is None or old_text == new_text:
+        return []
+    return list(
+        difflib.unified_diff(
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile="v1/SKILL.md",
+            tofile="v2/SKILL.md",
+            lineterm="",
+        )
+    )
+
+
+def _fmt(value) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> int:
+    if args.skill not in skills:
+        fail(f"no evaluation for {args.skill}; available: {', '.join(skills) or 'none'}")
+    runs_root = skills[args.skill] / "runs"
+    old_path = runs_root / args.old / "experiment.json"
+    new_path = runs_root / args.new / "experiment.json"
+    old = read_json(old_path)
+    new = read_json(new_path)
+    if not isinstance(old, dict):
+        fail(f"cannot read experiment manifest: {old_path}")
+    if not isinstance(new, dict):
+        fail(f"cannot read experiment manifest: {new_path}")
+
+    print(f"Comparing {args.skill}: {args.old} (v1) -> {args.new} (v2)\n")
+    partition = partition_cases(old.get("test_cases", []), new.get("test_cases", []))
+    if partition["only_old"]:
+        print(f"Dropped in v2 (not compared): {', '.join(partition['only_old'])}")
+    if partition["only_new"]:
+        print(f"Added in v2 (no v1 baseline, not compared): {', '.join(partition['only_new'])}")
+    if partition["only_old"] or partition["only_new"]:
+        print("WARNING: test-case sets differ; aggregate comparison is weakened.\n")
+    if not partition["both"]:
+        print("No shared test cases to compare.")
+        return 1
+
+    improved = regressed = 0
+    for test_case in partition["both"]:
+        old_cell = _cell(old, test_case, "with-skill")
+        new_cell = _cell(new, test_case, "with-skill")
+        diff = compare_cell(old_cell, new_cell)
+        old_rep = _case_representative(old, test_case, "with-skill")
+        new_rep = _case_representative(new, test_case, "with-skill")
+        confounds = _confounds(old_rep, new_rep)
+
+        print(f"## {test_case}")
+        for axis in ("score", "pass_rate", "billed_output_tokens"):
+            a = diff[axis]
+            print(
+                f"  {axis:22s} {_fmt(a['old'])} -> {_fmt(a['new'])}  [{a['verdict']}]"
+            )
+        if diff["score"]["verdict"] == "improved":
+            improved += 1
+        elif diff["score"]["verdict"] == "regressed":
+            regressed += 1
+        if confounds:
+            print(f"  CONFOUNDED: {'; '.join(confounds)} "
+                  "(hold everything but the skill constant)")
+        print()
+
+    print(f"Score verdict over {len(partition['both'])} shared case(s): "
+          f"{improved} improved, {regressed} regressed, "
+          f"{len(partition['both']) - improved - regressed} unchanged")
+
+    skill_diff = _skill_diff(
+        _case_representative(old, partition["both"][0], "with-skill"),
+        _case_representative(new, partition["both"][0], "with-skill"),
+    )
+    if skill_diff:
+        print("\n## Skill language change (v1 -> v2)")
+        for line in skill_diff:
+            print(f"  {line}")
+    elif skill_diff == []:
+        print("\n(No skill-language diff available or snapshots identical.)")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     skills = discover_skills(EVALS_ROOT, SKILLS_ROOT)
@@ -654,6 +869,8 @@ def main() -> int:
         return list_evaluations(args, skills)
     if args.command == "check":
         return check_evaluation(args, skills)
+    if args.command == "compare":
+        return compare_experiments(args, skills)
     return run_evaluation(args, skills)
 
 
