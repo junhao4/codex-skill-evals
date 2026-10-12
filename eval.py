@@ -237,6 +237,23 @@ def markdown_cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+def format_delta(old, new) -> str:
+    """Render a signed absolute + percent change, e.g. '-73 (-6.7%)'. Pure.
+
+    Returns 'n/a' when either value is missing, and omits the percent when the
+    old value is zero (percent change is undefined against a zero baseline).
+    """
+    if old is None or new is None:
+        return "n/a"
+    diff = new - old
+    whole = float(diff).is_integer()
+    abs_text = f"{int(diff):+d}" if whole else f"{diff:+.2f}"
+    if old == 0:
+        return abs_text if diff == 0 else f"{abs_text} (n/a%)"
+    percent = diff / old * 100
+    return f"{abs_text} ({percent:+.1f}%)"
+
+
 def write_report(
     experiment_root: Path,
     experiment: dict,
@@ -346,7 +363,8 @@ def write_report(
         for name, comparison in comparisons.items():
             lines.append(
                 f"| {markdown_cell(name)} | {comparison['baseline_mean']} | "
-                f"{comparison['with_skill_mean']} | {comparison['delta']:+} |"
+                f"{comparison['with_skill_mean']} | "
+                f"{format_delta(comparison['baseline_mean'], comparison['with_skill_mean'])} |"
             )
 
     cells = aggregates.get("cells", {})
@@ -387,14 +405,19 @@ def write_report(
                 )
             td = comparisons.get(name, {}).get("token_delta")
             if isinstance(td, dict):
-                lines.append(
-                    f"| {markdown_cell(name)} | **delta** | "
-                    f"{td.get('uncached_input_tokens', 0):+} | "
-                    f"{td.get('cached_input_tokens', 0):+} | "
-                    f"{td.get('output_tokens', 0):+} | "
-                    f"{td.get('reasoning_output_tokens', 0):+} | "
-                    f"{td.get('billed_output_tokens', 0):+} |"
+                base_mt = cells.get(name, {}).get("baseline", {}).get("mean_tokens", {})
+                skill_mt = cells.get(name, {}).get("with-skill", {}).get("mean_tokens", {})
+                fields = (
+                    "uncached_input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "billed_output_tokens",
                 )
+                cell_text = " | ".join(
+                    format_delta(base_mt.get(f, 0), skill_mt.get(f, 0)) for f in fields
+                )
+                lines.append(f"| {markdown_cell(name)} | **delta** | {cell_text} |")
 
     failed = [
         result
@@ -683,7 +706,11 @@ def _case_representative(experiment: dict, test_case: str, configuration: str) -
 
 
 def compare_cell(old_cell: dict, new_cell: dict) -> dict:
-    """Diff two with-skill cells (score, pass rate, output+reasoning tokens). Pure."""
+    """Diff two with-skill cells across score, pass rate, and token axes. Pure.
+
+    Verdict direction: score and pass rate are higher-is-better; every token
+    axis is lower-is-better (fewer tokens for equal-or-better score is the win).
+    """
     old_score = old_cell.get("mean_score")
     new_score = new_cell.get("mean_score")
 
@@ -693,16 +720,12 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
 
     old_pass = _pass_rate(old_cell)
     new_pass = _pass_rate(new_cell)
+    old_tokens = old_cell.get("mean_tokens") or {}
+    new_tokens = new_cell.get("mean_tokens") or {}
 
-    def _billed(cell: dict):
-        tokens = cell.get("mean_tokens") or {}
-        out = tokens.get("output_tokens", 0) or 0
-        reasoning = tokens.get("reasoning_output_tokens", 0) or 0
-        return out + reasoning
-
-    old_tokens = _billed(old_cell)
-    new_tokens = _billed(new_cell)
-    return {
+    result = {
+        "n_old": old_cell.get("total_trials", 0),
+        "n_new": new_cell.get("total_trials", 0),
         "score": {
             "old": old_score,
             "new": new_score,
@@ -713,14 +736,23 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
             "new": new_pass,
             "verdict": _axis_verdict(old_pass, new_pass, higher_is_better=True),
         },
-        # Fewer output+reasoning tokens for equal-or-better score is the
-        # optimisation win, so lower is better on this axis.
-        "billed_output_tokens": {
-            "old": old_tokens,
-            "new": new_tokens,
-            "verdict": _axis_verdict(old_tokens, new_tokens, higher_is_better=False),
-        },
     }
+    # Token axes that reflect a skill-wording change: uncached input (a shorter
+    # skill means less context every turn), output, reasoning, and billed total.
+    for axis in (
+        "uncached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "billed_output_tokens",
+    ):
+        old_value = old_tokens.get(axis)
+        new_value = new_tokens.get(axis)
+        result[axis] = {
+            "old": old_value,
+            "new": new_value,
+            "verdict": _axis_verdict(old_value, new_value, higher_is_better=False),
+        }
+    return result
 
 
 def partition_cases(old_cases: list[str], new_cases: list[str]) -> dict:
@@ -796,6 +828,118 @@ def _fmt(value) -> str:
     return str(value)
 
 
+def render_comparison_markdown(
+    skill: str, old_id: str, new_id: str, partition: dict, rows: list[dict],
+    skill_diff: list[str], summary: dict, provenance: dict,
+) -> str:
+    """Build the markdown comparison report. Pure (no I/O)."""
+    trials = provenance.get("trials") or {}
+    old_trials = trials.get("old")
+    new_trials = trials.get("new")
+    old_model = provenance.get("old_model") or "not captured"
+    new_model = provenance.get("new_model") or "not captured"
+    old_effort = provenance.get("old_effort") or "not captured"
+    new_effort = provenance.get("new_effort") or "not captured"
+    models_match = (
+        provenance.get("old_model")
+        and provenance.get("new_model")
+        and provenance["old_model"] == provenance["new_model"]
+        and provenance.get("old_effort") == provenance.get("new_effort")
+    )
+
+    lines = [
+        f"# Comparison: {skill} — {old_id} (v1) vs {new_id} (v2)",
+        "",
+        "Read-only diff of two experiments of the same skill suite. Cases are "
+        "matched by name; only shared cases are compared. Every per-case number "
+        "is a MEAN over that cell's trials (shown as `n=` in each case header).",
+        "",
+        "Token terms: `billed output` = output + reasoning (reasoning bills as "
+        "output); `uncached input` = input - cached. On the token axes, LOWER is "
+        "better (fewer tokens for an equal-or-better score is the optimisation "
+        "win). Token counts are only comparable across runs on the SAME model and "
+        "reasoning effort — see the setup row below.",
+        "",
+        "| Setup | v1 (" + old_id + ") | v2 (" + new_id + ") |",
+        "|---|---|---|",
+        f"| Model | {old_model} | {new_model} |",
+        f"| Reasoning effort | {old_effort} | {new_effort} |",
+        f"| Trials per cell | {old_trials if old_trials is not None else '?'} "
+        f"| {new_trials if new_trials is not None else '?'} |",
+        "",
+    ]
+    if not models_match:
+        lines.append(
+            "> WARNING: model and/or reasoning effort differ between the two "
+            "experiments. Score and especially token comparisons may be "
+            "confounded by the model change rather than the skill edit."
+        )
+        lines.append("")
+    lines.extend([
+        "| Summary | Value |",
+        "|---|---|",
+        f"| Shared cases | {len(partition['both'])} |",
+        f"| Improved (score) | {summary['improved']} |",
+        f"| Regressed (score) | {summary['regressed']} |",
+        f"| Unchanged (score) | {summary['unchanged']} |",
+    ])
+    if partition["only_old"]:
+        lines.append(f"| Dropped in v2 (not compared) | {', '.join(partition['only_old'])} |")
+    if partition["only_new"]:
+        lines.append(f"| Added in v2 (not compared) | {', '.join(partition['only_new'])} |")
+    lines.append("")
+    if partition["only_old"] or partition["only_new"]:
+        lines.append("> WARNING: test-case sets differ; aggregate comparison is weakened.")
+        lines.append("")
+
+    AXES = [
+        ("score", "score"),
+        ("pass_rate", "pass rate"),
+        ("uncached_input_tokens", "uncached input"),
+        ("output_tokens", "output"),
+        ("reasoning_output_tokens", "reasoning"),
+        ("billed_output_tokens", "billed output"),
+    ]
+    for row in rows:
+        diff = row["diff"]
+        n_old = diff.get("n_old", "?")
+        n_new = diff.get("n_new", "?")
+        lines.append(
+            f"## {row['test_case']}  (mean of n={n_old} v1 trial(s) -> "
+            f"n={n_new} v2 trial(s))"
+        )
+        lines.append("")
+        lines.append("| Axis | v1 | v2 | Change | Verdict |")
+        lines.append("|---|---|---|---|---|")
+        for key, label in AXES:
+            a = diff.get(key)
+            if not a:
+                continue
+            lines.append(
+                f"| {label} | {_fmt(a['old'])} | {_fmt(a['new'])} | "
+                f"{format_delta(a['old'], a['new'])} | {a['verdict']} |"
+            )
+        lines.append("")
+        if row["confounds"]:
+            lines.append(
+                f"> CONFOUNDED: {'; '.join(row['confounds'])} "
+                "(hold everything but the skill constant)."
+            )
+            lines.append("")
+
+    lines.append("## Skill language change (v1 -> v2)")
+    lines.append("")
+    if skill_diff:
+        lines.append("```diff")
+        lines.extend(skill_diff)
+        lines.append("```")
+    else:
+        lines.append("_No skill-language diff available "
+                     "(snapshots missing or identical)._")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     if args.skill not in skills:
         fail(f"no evaluation for {args.skill}; available: {', '.join(skills) or 'none'}")
@@ -809,19 +953,14 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
     if not isinstance(new, dict):
         fail(f"cannot read experiment manifest: {new_path}")
 
-    print(f"Comparing {args.skill}: {args.old} (v1) -> {args.new} (v2)\n")
     partition = partition_cases(old.get("test_cases", []), new.get("test_cases", []))
-    if partition["only_old"]:
-        print(f"Dropped in v2 (not compared): {', '.join(partition['only_old'])}")
-    if partition["only_new"]:
-        print(f"Added in v2 (no v1 baseline, not compared): {', '.join(partition['only_new'])}")
-    if partition["only_old"] or partition["only_new"]:
-        print("WARNING: test-case sets differ; aggregate comparison is weakened.\n")
     if not partition["both"]:
+        print(f"Comparing {args.skill}: {args.old} -> {args.new}")
         print("No shared test cases to compare.")
         return 1
 
     improved = regressed = 0
+    rows: list[dict] = []
     for test_case in partition["both"]:
         old_cell = _cell(old, test_case, "with-skill")
         new_cell = _cell(new, test_case, "with-skill")
@@ -829,36 +968,59 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
         old_rep = _case_representative(old, test_case, "with-skill")
         new_rep = _case_representative(new, test_case, "with-skill")
         confounds = _confounds(old_rep, new_rep)
-
-        print(f"## {test_case}")
-        for axis in ("score", "pass_rate", "billed_output_tokens"):
-            a = diff[axis]
-            print(
-                f"  {axis:22s} {_fmt(a['old'])} -> {_fmt(a['new'])}  [{a['verdict']}]"
-            )
+        rows.append({"test_case": test_case, "diff": diff, "confounds": confounds})
         if diff["score"]["verdict"] == "improved":
             improved += 1
         elif diff["score"]["verdict"] == "regressed":
             regressed += 1
-        if confounds:
-            print(f"  CONFOUNDED: {'; '.join(confounds)} "
-                  "(hold everything but the skill constant)")
-        print()
 
-    print(f"Score verdict over {len(partition['both'])} shared case(s): "
-          f"{improved} improved, {regressed} regressed, "
-          f"{len(partition['both']) - improved - regressed} unchanged")
-
+    unchanged = len(partition["both"]) - improved - regressed
     skill_diff = _skill_diff(
         _case_representative(old, partition["both"][0], "with-skill"),
         _case_representative(new, partition["both"][0], "with-skill"),
     )
-    if skill_diff:
-        print("\n## Skill language change (v1 -> v2)")
-        for line in skill_diff:
-            print(f"  {line}")
-    elif skill_diff == []:
-        print("\n(No skill-language diff available or snapshots identical.)")
+
+    # Provenance for the comparability caveat: model + reasoning effort actually
+    # resolved, read from a representative trial of each experiment, plus trials
+    # per cell. Token/score comparisons are only valid on the same model/effort.
+    old_rep0 = _case_representative(old, partition["both"][0], "with-skill")
+    new_rep0 = _case_representative(new, partition["both"][0], "with-skill")
+    provenance = {
+        "old_model": old_rep0.get("resolved_model"),
+        "new_model": new_rep0.get("resolved_model"),
+        "old_effort": old_rep0.get("resolved_reasoning_effort"),
+        "new_effort": new_rep0.get("resolved_reasoning_effort"),
+        "trials": {"old": old.get("trials"), "new": new.get("trials")},
+    }
+
+    # Write the full report to a comparisons/ dir that is a sibling of runs/, so
+    # comparison artifacts never mutate an immutable experiment dir.
+    summary = {"improved": improved, "regressed": regressed, "unchanged": unchanged}
+    markdown = render_comparison_markdown(
+        args.skill, args.old, args.new, partition, rows, skill_diff, summary,
+        provenance,
+    )
+    comparisons_root = skills[args.skill] / "comparisons"
+    comparisons_root.mkdir(parents=True, exist_ok=True)
+    out_path = comparisons_root / f"{args.old}-vs-{args.new}.md"
+    out_path.write_text(markdown, encoding="utf-8")
+
+    # Terminal stays short: the detail lives in the file.
+    print(f"Comparing {args.skill}: {args.old} (v1) -> {args.new} (v2)")
+    print(
+        f"  {len(partition['both'])} shared case(s): "
+        f"{improved} improved, {regressed} regressed, {unchanged} unchanged (by score)"
+    )
+    if partition["only_old"] or partition["only_new"]:
+        print(
+            f"  Note: test-case sets differ "
+            f"(+{len(partition['only_new'])} new, -{len(partition['only_old'])} dropped); "
+            "not compared."
+        )
+    confounded = [r["test_case"] for r in rows if r["confounds"]]
+    if confounded:
+        print(f"  Confounded (model/fixture changed): {', '.join(confounded)}")
+    print(f"Report: {out_path}")
     return 0
 
 
