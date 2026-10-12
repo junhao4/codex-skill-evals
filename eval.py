@@ -163,9 +163,20 @@ def aggregate(results: list[dict]) -> dict:
         test_case = cells.setdefault(result["test_case"], {})
         cell = test_case.setdefault(
             result["configuration"],
-            {"scores": [], "token_samples": [], "passed_trials": 0, "total_trials": 0},
+            {
+                "scores": [],
+                "token_samples": [],
+                "passed_trials": 0,
+                "needs_review_trials": 0,
+                "total_trials": 0,
+            },
         )
         cell["total_trials"] += 1
+        if result.get("needs_review") or result.get("status") == "needs_review":
+            # Neither a pass nor a fail: an honest "not enough evidence to
+            # decide". Excluded from passed_trials and from the score mean.
+            cell["needs_review_trials"] += 1
+            continue
         cell["passed_trials"] += int(result["overall_pass"])
         if isinstance(result["score"], (int, float)):
             cell["scores"].append(result["score"])
@@ -254,6 +265,7 @@ def write_report(
         f"| Outcome | **{outcome}** |",
         f"| Mean score | {score_text} |",
         f"| Passed trials | {experiment.get('passed_trials', 0)}/{len(results)} |",
+        f"| Needs review | {experiment.get('needs_review_trials', 0)}/{len(results)} |",
         f"| Completed trials | {len(results)}/{experiment['worker_trials']} |",
         f"| Experiment status | {experiment['status']} |",
         f"| Semantic judges | {experiment.get('semantic_judges', 0)} per eligible trial |",
@@ -293,7 +305,14 @@ def write_report(
                         markdown_cell(result["configuration"]),
                         str(result["trial"]),
                         str(shown_score),
-                        "Yes" if result["overall_pass"] else "No",
+                        (
+                            "Review"
+                            if (
+                                result.get("needs_review")
+                                or result.get("status") == "needs_review"
+                            )
+                            else ("Yes" if result["overall_pass"] else "No")
+                        ),
                         f"[result.json]({details.as_posix()})",
                     ]
                 )
@@ -366,7 +385,14 @@ def write_report(
                     f"{td.get('billed_output_tokens', 0):+} |"
                 )
 
-    failed = [result for result in results if not result["overall_pass"]]
+    failed = [
+        result
+        for result in results
+        if not result["overall_pass"]
+        and not (
+            result.get("needs_review") or result.get("status") == "needs_review"
+        )
+    ]
     if failed or experiment.get("error"):
         lines.extend(["", "## Main failure reasons", ""])
         if experiment.get("error"):
@@ -404,23 +430,34 @@ def finalize_experiment(
     results: list[dict],
 ) -> tuple[dict, Path]:
     """Merge final summaries into experiment.json and generate report.md."""
+
+    def is_needs_review(result: dict) -> bool:
+        return bool(result.get("needs_review")) or result.get("status") == "needs_review"
+
     scores = [
         result["score"]
         for result in results
-        if isinstance(result.get("score"), (int, float))
+        if isinstance(result.get("score"), (int, float)) and not is_needs_review(result)
     ]
     aggregates = aggregate(results)
     experiment["graded_trials"] = sum(
         result["status"] == "graded" for result in results
     )
-    experiment["passed_trials"] = sum(result["overall_pass"] for result in results)
+    experiment["needs_review_trials"] = sum(
+        is_needs_review(result) for result in results
+    )
+    # passed/overall_pass count only DECIDED trials. A needs_review trial is
+    # neither a pass nor a fail: it is excluded from the pass tally and does not
+    # by itself fail the experiment (it is surfaced separately for a human).
+    decided = [result for result in results if not is_needs_review(result)]
+    experiment["passed_trials"] = sum(result["overall_pass"] for result in decided)
     experiment["completed_trials"] = len(results)
     experiment["mean_score"] = round(sum(scores) / len(scores), 2) if scores else None
     experiment["overall_pass"] = (
         experiment["status"] == "completed"
         and len(results) == experiment["worker_trials"]
-        and bool(results)
-        and all(result["overall_pass"] for result in results)
+        and bool(decided)
+        and all(result["overall_pass"] for result in decided)
     )
     experiment["aggregates"] = aggregates
     experiment["results"] = results

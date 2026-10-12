@@ -31,6 +31,20 @@ class HarnessError(ValueError):
     """Raised when an evaluation definition or run is invalid."""
 
 
+# Categorical verdict enum (step 1 part 2). Optional and backward compatible:
+# when a grade omits `verdict`, `overall_pass` stays authoritative. When present,
+# `overall_pass` is derived from it — only "pass" is a pass; "fail"/"partial" are
+# decisive non-passes; "insufficient_evidence" is an abstention (not a pass).
+VERDICTS = ("pass", "partial", "fail", "insufficient_evidence")
+PASSING_VERDICTS = ("pass",)
+ABSTAIN_VERDICT = "insufficient_evidence"
+
+
+def verdict_implies_pass(verdict: str) -> bool:
+    """Map a categorical verdict to its boolean pass sense. Pure."""
+    return verdict in PASSING_VERDICTS
+
+
 @dataclass(frozen=True)
 class Case:
     name: str
@@ -670,12 +684,26 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
     errors: list[str] = []
     if value is None:
         return False, ["grader did not produce a JSON object"]
-    allowed_top_level = {"overall_pass", "score", "checks", "limitations"}
+    allowed_top_level = {"overall_pass", "verdict", "score", "checks", "limitations"}
     unknown_top_level = sorted(set(value) - allowed_top_level)
     if unknown_top_level:
         errors.append("unexpected top-level fields: " + ", ".join(unknown_top_level))
     if not isinstance(value.get("overall_pass"), bool):
         errors.append("overall_pass must be boolean")
+    # Optional categorical verdict. When present it must be a known enum value
+    # and must agree with overall_pass (which stays authoritative/required for
+    # backward compatibility). "insufficient_evidence" is not a pass.
+    if "verdict" in value:
+        verdict = value.get("verdict")
+        if verdict not in VERDICTS:
+            errors.append("verdict must be one of " + ", ".join(VERDICTS))
+        elif isinstance(value.get("overall_pass"), bool) and (
+            verdict_implies_pass(verdict) != value["overall_pass"]
+        ):
+            errors.append(
+                f"verdict {verdict!r} disagrees with overall_pass "
+                f"{value['overall_pass']!r}"
+            )
     score = value.get("score")
     if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
         errors.append("score must be an integer from 0 to 100")
@@ -683,8 +711,7 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
     if not isinstance(checks, list) or not checks:
         errors.append("checks must be a non-empty list")
     else:
-        points = []
-        allowed_check_fields = {"id", "pass", "points", "notes"}
+        allowed_check_fields = {"id", "pass", "verdict", "points", "notes"}
         for index, check in enumerate(checks):
             if not isinstance(check, dict):
                 errors.append(f"check {index} must be an object")
@@ -699,6 +726,10 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
                 errors.append(f"check {index} needs an id")
             if not isinstance(check.get("pass"), bool):
                 errors.append(f"check {index} pass must be boolean")
+            if "verdict" in check and check.get("verdict") not in VERDICTS:
+                errors.append(
+                    f"check {index} verdict must be one of " + ", ".join(VERDICTS)
+                )
             point = check.get("points")
             if (
                 not isinstance(point, int)
@@ -706,16 +737,8 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
                 or not 0 <= point <= 100
             ):
                 errors.append(f"check {index} points must be 0..100")
-            else:
-                points.append(point)
             if not isinstance(check.get("notes"), str):
                 errors.append(f"check {index} needs notes")
-        if (
-            isinstance(score, int)
-            and not isinstance(score, bool)
-            and sum(points) != score
-        ):
-            errors.append(f"score {score} does not equal check-point sum {sum(points)}")
     limitations = value.get("limitations")
     if not isinstance(limitations, list):
         errors.append("limitations must be a list")
@@ -800,6 +823,17 @@ def combine_semantic_judges(
 
     judges = sorted(judges, key=lambda judge: judge["judge"])
     valid_judges = [judge for judge in judges if judge["status"] == "completed"]
+
+    # A valid judge whose categorical verdict is "insufficient_evidence" ABSTAINS:
+    # it is excluded from both the pass-vote tally and the score median. Quorum is
+    # measured against the DECIDING judges (valid minus abstainers), so an honest
+    # "cannot decide" is not silently reported as FAIL.
+    def abstains(judge: dict[str, Any]) -> bool:
+        result = judge.get("result")
+        return isinstance(result, dict) and result.get("verdict") == ABSTAIN_VERDICT
+
+    abstaining_judges = [judge for judge in valid_judges if abstains(judge)]
+    deciding_judges = [judge for judge in valid_judges if not abstains(judge)]
     quorum = requested_count // 2 + 1
     errors = [
         f"judge {judge['judge']}: "
@@ -819,13 +853,34 @@ def combine_semantic_judges(
             "judges": judges,
         }
 
-    scores = [int(judge["result"]["score"]) for judge in valid_judges]
-    passing_votes = sum(bool(judge["result"]["overall_pass"]) for judge in valid_judges)
+    # Enough judges ran, but too few could DECIDE (the rest abstained). This is a
+    # distinct terminal state from "invalid" (graders errored) and from "fail"
+    # (judges decided it failed): there is not enough evidence to decide.
+    if len(deciding_judges) < quorum:
+        return {
+            "status": "needs_review",
+            "result": None,
+            "errors": [
+                f"only {len(deciding_judges)}/{requested_count} deciding judges "
+                f"(quorum {quorum}); {len(abstaining_judges)} abstained with "
+                f"{ABSTAIN_VERDICT}"
+            ]
+            + errors,
+            "quorum": quorum,
+            "deciding_judges": len(deciding_judges),
+            "abstaining_judges": len(abstaining_judges),
+            "judges": judges,
+        }
+
+    scores = [int(judge["result"]["score"]) for judge in deciding_judges]
+    passing_votes = sum(
+        bool(judge["result"]["overall_pass"]) for judge in deciding_judges
+    )
     consensus_pass = passing_votes >= quorum
     consensus_score = round(median(scores))
     limitations = [
         limitation
-        for judge in valid_judges
+        for judge in deciding_judges
         for limitation in judge["result"].get("limitations", [])
     ]
     limitations.extend(errors)
@@ -838,8 +893,9 @@ def combine_semantic_judges(
                 "pass": consensus_pass,
                 "points": consensus_score,
                 "notes": (
-                    f"{passing_votes}/{requested_count} judges voted pass; "
-                    f"valid judge scores: {scores}; consensus uses the median."
+                    f"{passing_votes}/{len(deciding_judges)} deciding judges voted "
+                    f"pass ({len(abstaining_judges)} abstained of {requested_count} "
+                    f"requested); deciding scores: {scores}; consensus uses the median."
                 ),
             }
         ],
@@ -850,6 +906,8 @@ def combine_semantic_judges(
         "result": consensus,
         "errors": errors,
         "quorum": quorum,
+        "deciding_judges": len(deciding_judges),
+        "abstaining_judges": len(abstaining_judges),
         "judges": judges,
     }
 
@@ -1021,6 +1079,19 @@ def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
     graders_pass = graders_valid and all(
         bool(grade["result"].get("overall_pass")) for grade in requested_grades
     )
+    # A trial "needs review" when no requested grader errored outright but at
+    # least one reached the distinct `needs_review` terminal state (jury
+    # abstention) — an honest "not enough evidence to decide", neither pass nor
+    # fail. It never overrides a genuine grader error ("invalid").
+    any_invalid = any(
+        grade["status"] not in ("completed", "needs_review")
+        for grade in requested_grades
+    )
+    needs_review = (
+        bool(requested_grades)
+        and not any_invalid
+        and any(grade["status"] == "needs_review" for grade in requested_grades)
+    )
     deterministic_result = deterministic.get("result")
     semantic_result = semantic.get("result")
     headline = (
@@ -1029,6 +1100,7 @@ def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
     return {
         "graders_valid": graders_valid,
         "graders_pass": graders_pass,
+        "needs_review": needs_review,
         "headline": headline,
     }
 
@@ -1303,6 +1375,13 @@ def run_trial(
     graders_valid = outcome["graders_valid"]
     graders_pass = outcome["graders_pass"]
     headline = outcome["headline"]
+    # A trial needs review only when it did not otherwise fail for a concrete
+    # reason (worker crash or protected-input tampering) and a grader abstained.
+    trial_needs_review = (
+        outcome["needs_review"]
+        and worker_exit_code == 0
+        and final_state["protected_inputs_intact"]
+    )
     failure_reasons: list[str] = []
     if worker_exit_code != 0:
         failure_reasons.append(f"Worker exited with code {worker_exit_code}.")
@@ -1320,7 +1399,11 @@ def run_trial(
     write_json(run_dir / "run.json", metadata)
 
     result = {
-        "status": "graded" if graders_valid else "ungraded",
+        "status": (
+            "needs_review"
+            if trial_needs_review
+            else ("graded" if graders_valid else "ungraded")
+        ),
         "skill": skill_root.name,
         "test_case": case.name,
         "configuration": configuration,
@@ -1330,6 +1413,7 @@ def run_trial(
             and final_state["protected_inputs_intact"]
             and graders_pass
         ),
+        "needs_review": trial_needs_review,
         "score": headline.get("score") if isinstance(headline, dict) else None,
         "deterministic_score": deterministic_result.get("score")
         if isinstance(deterministic_result, dict)
@@ -1398,14 +1482,22 @@ def regrade_with_semantic(
     headline = outcome["headline"]
     protected = result.get("protected_inputs_intact", True)
     worker_exit = result.get("worker_exit_code", 0)
+    trial_needs_review = (
+        outcome["needs_review"] and worker_exit == 0 and protected
+    )
 
     failure_reasons = [r for r in result.get("failure_reasons", []) if "semantic" not in r]
     failure_reasons.extend(grade_failure_reasons("semantic", semantic))
 
     result.update(
         {
-            "status": "graded" if graders_valid else "ungraded",
+            "status": (
+                "needs_review"
+                if trial_needs_review
+                else ("graded" if graders_valid else "ungraded")
+            ),
             "overall_pass": worker_exit == 0 and protected and graders_pass,
+            "needs_review": trial_needs_review,
             "score": headline.get("score") if isinstance(headline, dict) else None,
             "semantic_score": sem_result.get("score") if isinstance(sem_result, dict) else None,
             "semantic_pass": sem_result.get("overall_pass") if isinstance(sem_result, dict) else None,
