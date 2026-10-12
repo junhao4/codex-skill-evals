@@ -81,6 +81,23 @@ def test_grade_level_verdict_pass_agrees():
     assert valid, errors
 
 
+def test_grade_level_verdict_null_is_treated_as_absent():
+    # The strict output schema makes verdict required-but-nullable, so the model
+    # emits verdict:null when it has no categorical verdict. That must validate
+    # exactly like an absent verdict (regression guard for the schema-400 bug).
+    valid, errors = validate_grade(_grade(verdict=None, overall_pass=True))
+    assert valid, errors
+
+
+def test_check_level_verdict_null_is_treated_as_absent():
+    grade = _grade(
+        checks=[{"id": "c1", "pass": True, "verdict": None, "points": 80,
+                 "notes": "ok"}],
+    )
+    valid, errors = validate_grade(grade)
+    assert valid, errors
+
+
 def test_grade_level_verdict_fail_agrees():
     valid, errors = validate_grade(_grade(verdict="fail", overall_pass=False))
     assert valid, errors

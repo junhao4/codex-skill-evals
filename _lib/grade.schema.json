@@ -6,8 +6,8 @@
   "properties": {
     "overall_pass": { "type": "boolean" },
     "verdict": {
-      "type": "string",
-      "enum": ["pass", "partial", "fail", "insufficient_evidence"]
+      "type": ["string", "null"],
+      "enum": ["pass", "partial", "fail", "insufficient_evidence", null]
     },
     "score": { "type": "integer", "minimum": 0, "maximum": 100 },
     "checks": {
@@ -20,13 +20,13 @@
           "id": { "type": "string" },
           "pass": { "type": "boolean" },
           "verdict": {
-            "type": "string",
-            "enum": ["pass", "partial", "fail", "insufficient_evidence"]
+            "type": ["string", "null"],
+            "enum": ["pass", "partial", "fail", "insufficient_evidence", null]
           },
           "points": { "type": "integer", "minimum": 0, "maximum": 100 },
           "notes": { "type": "string" }
         },
-        "required": ["id", "pass", "points", "notes"]
+        "required": ["id", "pass", "verdict", "points", "notes"]
       }
     },
     "limitations": {
@@ -34,5 +34,5 @@
       "items": { "type": "string" }
     }
   },
-  "required": ["overall_pass", "score", "checks", "limitations"]
+  "required": ["overall_pass", "verdict", "score", "checks", "limitations"]
 }

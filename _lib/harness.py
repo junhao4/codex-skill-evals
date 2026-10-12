@@ -707,10 +707,12 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
         errors.append("unexpected top-level fields: " + ", ".join(unknown_top_level))
     if not isinstance(value.get("overall_pass"), bool):
         errors.append("overall_pass must be boolean")
-    # Optional categorical verdict. When present it must be a known enum value
-    # and must agree with overall_pass (which stays authoritative/required for
-    # backward compatibility). "insufficient_evidence" is not a pass.
-    if "verdict" in value:
+    # Optional categorical verdict. The strict output schema makes it
+    # required-but-nullable, so a null verdict means "not supplied" and is
+    # treated exactly like an absent one. When a non-null value is present it
+    # must be a known enum value and must agree with overall_pass (which stays
+    # authoritative/required). "insufficient_evidence" is not a pass.
+    if value.get("verdict") is not None:
         verdict = value.get("verdict")
         if verdict not in VERDICTS:
             errors.append("verdict must be one of " + ", ".join(VERDICTS))
@@ -743,7 +745,7 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
                 errors.append(f"check {index} needs an id")
             if not isinstance(check.get("pass"), bool):
                 errors.append(f"check {index} pass must be boolean")
-            if "verdict" in check and check.get("verdict") not in VERDICTS:
+            if check.get("verdict") is not None and check.get("verdict") not in VERDICTS:
                 errors.append(
                     f"check {index} verdict must be one of " + ", ".join(VERDICTS)
                 )
