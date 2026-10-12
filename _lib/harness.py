@@ -205,6 +205,23 @@ def find_rollout(thread_id: str | None, sessions_root: Path) -> Path | None:
     return matches[0] if matches else None
 
 
+def read_skill_snapshot_text(run_dir: Path, metadata: dict[str, Any]) -> str | None:
+    """Read the captured SKILL.md text from a run's immutable skill snapshot.
+
+    READ-ONLY. Resolves the `skill_snapshot` path recorded in run.json relative
+    to its run dir and returns the snapshot's SKILL.md content, or None when no
+    snapshot was captured (e.g. a baseline trial) or the file is absent. Pure
+    enough to unit-test with a temporary directory.
+    """
+    relative = metadata.get("skill_snapshot")
+    if not isinstance(relative, str) or not relative:
+        return None
+    skill_md = run_dir / relative / "SKILL.md"
+    if not skill_md.is_file():
+        return None
+    return skill_md.read_text(encoding="utf-8", errors="replace")
+
+
 def concatenate_files(sources: list[Path], destination: Path) -> None:
     """Combine text evidence files while preserving valid line boundaries."""
     with destination.open("w", encoding="utf-8") as output:
@@ -1148,6 +1165,27 @@ def run_trial(
         injected_supporting_skills[supporting_skill.name] = injected
     shutil.copy2(case.prompt, workspace / "TASK.md")
 
+    # Immutable skill snapshot (Layer 2a). Capture a readable copy of exactly the
+    # skill bytes this run injected into a dedicated run-dir location, SEPARATE
+    # from workspace/ so the worker can never mutate it. skill_sha256 proves two
+    # runs differ; this snapshot lets a later `compare` show WHAT changed. We
+    # capture supporting skills too, since those may not exist in any repo.
+    snapshot_root = run_dir / "skill-snapshot"
+    skill_snapshot_rel: str | None = None
+    supporting_skill_snapshot_rel: dict[str, str] = {}
+    if has_skill:
+        skill_snapshot = snapshot_root / skill_root.name
+        skill_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(skill_root, skill_snapshot)
+        skill_snapshot_rel = str(skill_snapshot.relative_to(run_dir))
+    for supporting_skill in case.supporting_skills:
+        snapshot = snapshot_root / supporting_skill.name
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(supporting_skill, snapshot)
+        supporting_skill_snapshot_rel[supporting_skill.name] = str(
+            snapshot.relative_to(run_dir)
+        )
+
     workspace_base_revision = commit_workspace_base(workspace)
     prompt_sha256 = hashlib.sha256(case.prompt.read_bytes()).hexdigest()
     skill_sha256 = directory_digest(skill_root)
@@ -1158,6 +1196,8 @@ def run_trial(
     metadata = {
         "skill": skill_root.name,
         "skill_sha256": skill_sha256,
+        "skill_snapshot": skill_snapshot_rel,
+        "supporting_skill_snapshot": supporting_skill_snapshot_rel,
         "test_case": case.name,
         "configuration": configuration,
         "trial": trial,
