@@ -12,11 +12,56 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from _lib.harness import (  # noqa: E402
     ABSTAIN_VERDICT,
+    PASS_THRESHOLD,
     combine_semantic_judges,
     grade_outcome,
+    score_band,
+    score_pass,
     validate_grade,
     verdict_implies_pass,
 )
+
+
+# --------------------------------------------------------------------------
+# score_pass / score_band — the simplified model's single source of truth
+# --------------------------------------------------------------------------
+
+
+def test_score_pass_threshold():
+    assert score_pass(PASS_THRESHOLD) is True
+    assert score_pass(PASS_THRESHOLD - 1) is False
+    assert score_pass(100) is True
+    assert score_pass(0) is False
+
+
+def test_score_band_mapping():
+    assert score_band(100) == "pass"
+    assert score_band(PASS_THRESHOLD) == "pass"
+    assert score_band(PASS_THRESHOLD - 1) == "partial"
+    assert score_band(1) == "partial"
+    assert score_band(0) == "fail"
+
+
+def test_consensus_pass_follows_median_score_not_emitted_bool():
+    # Score is authoritative: even if judges self-report overall_pass=True, a
+    # median score below the threshold must yield a non-pass consensus.
+    judges = [
+        _judge(1, True, 50),
+        _judge(2, True, 55),
+        _judge(3, True, 60),
+    ]
+    out = combine_semantic_judges(judges, 3)
+    assert out["status"] == "completed"
+    assert out["result"]["score"] == 55  # median
+    assert out["result"]["overall_pass"] is False  # 55 < 70, despite 3 "True"s
+    assert out["result"]["verdict"] == "partial"
+
+
+def test_consensus_band_is_derived_and_present():
+    judges = [_judge(1, True, 90), _judge(2, True, 95), _judge(3, True, 100)]
+    out = combine_semantic_judges(judges, 3)
+    assert out["result"]["overall_pass"] is True
+    assert out["result"]["verdict"] == "pass"
 
 
 # --------------------------------------------------------------------------
@@ -110,10 +155,15 @@ def test_abstaining_grade_validates():
     assert valid, errors
 
 
-def test_verdict_disagrees_with_overall_pass_rejected():
+def test_verdict_disagreement_is_no_longer_rejected():
+    # Simplified model: verdict is display-only and NOT cross-checked against
+    # overall_pass (score is authoritative). A grade whose verdict and
+    # overall_pass "disagree" must still validate — this is the regression guard
+    # for the partial+overall_pass:true bug.
     valid, errors = validate_grade(_grade(verdict="pass", overall_pass=False))
-    assert not valid
-    assert any("disagrees" in e for e in errors)
+    assert valid, errors
+    valid2, errors2 = validate_grade(_grade(verdict="partial", overall_pass=True))
+    assert valid2, errors2
 
 
 def test_unknown_verdict_rejected():

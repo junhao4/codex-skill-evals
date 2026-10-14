@@ -29,6 +29,7 @@ from harness import (  # noqa: E402
     read_skill_snapshot_text,
     regrade_with_semantic,
     run_trial,
+    score_band,
     validate_grade_schema,
     write_json,
 )
@@ -438,8 +439,8 @@ def write_report(
     if results:
         lines.extend(
             [
-                "| Test case | Configuration | Trial | Score | Pass | Details |",
-                "|---|---|---:|---:|---:|---|",
+                "| Test case | Configuration | Trial | Score | Band | Pass | Details |",
+                "|---|---|---:|:--:|---:|---:|---|",
             ]
         )
         for result in results:
@@ -452,6 +453,16 @@ def write_report(
             shown_score = (
                 result_score if isinstance(result_score, (int, float)) else "—"
             )
+            is_review = (
+                result.get("needs_review") or result.get("status") == "needs_review"
+            )
+            # Display band derived from score; "review" when the trial abstained.
+            band = (
+                "review"
+                if is_review
+                else (score_band(result_score)
+                      if isinstance(result_score, (int, float)) else "—")
+            )
             lines.append(
                 "| "
                 + " | ".join(
@@ -460,12 +471,10 @@ def write_report(
                         markdown_cell(result["configuration"]),
                         str(result["trial"]),
                         str(shown_score),
+                        band,
                         (
                             "Review"
-                            if (
-                                result.get("needs_review")
-                                or result.get("status") == "needs_review"
-                            )
+                            if is_review
                             else ("Yes" if result["overall_pass"] else "No")
                         ),
                         f"[result.json]({details.as_posix()})",

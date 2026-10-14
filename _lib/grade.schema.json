@@ -1,11 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Skill evaluation grade",
+  "$comment": "Grading model: `score` (0..100) is authoritative. `overall_pass` is derived (score >= pass threshold, default 70) and kept for compatibility. `verdict` is a display-only band (pass/partial/fail) also derivable from score; it is NOT cross-checked against overall_pass. `insufficient_evidence` is the one non-derivable signal: it means the judge could not evaluate and routes the trial to needs_review.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "overall_pass": { "type": "boolean" },
     "verdict": {
+      "$comment": "Display-only band / abstention signal. Optional (nullable). Not cross-checked against overall_pass.",
       "type": ["string", "null"],
       "enum": ["pass", "partial", "fail", "insufficient_evidence", null]
     },

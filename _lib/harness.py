@@ -31,18 +31,51 @@ class HarnessError(ValueError):
     """Raised when an evaluation definition or run is invalid."""
 
 
-# Categorical verdict enum (step 1 part 2). Optional and backward compatible:
-# when a grade omits `verdict`, `overall_pass` stays authoritative. When present,
-# `overall_pass` is derived from it — only "pass" is a pass; "fail"/"partial" are
-# decisive non-passes; "insufficient_evidence" is an abstention (not a pass).
+# Grading model (step 1 part 3 — simplified). `score` (0..100) is the SINGLE
+# source of truth. `overall_pass` is DERIVED: pass iff score >= PASS_THRESHOLD.
+# The categorical `verdict` (pass/partial/fail) is a DISPLAY-ONLY band also
+# derived from the score — it is never an independent input and is never
+# cross-checked against `overall_pass` (that cross-check caused a `partial` +
+# `overall_pass:true` grade to be wrongly rejected as invalid). The ONE
+# categorical signal that is NOT derivable from the score is abstention:
+# "insufficient_evidence" means the judge could not evaluate at all (distinct
+# from a low score, which is a real judgement). Abstention routes a trial to
+# `needs_review`. A deterministic check.py can always compute an answer, so only
+# an LLM judge ever abstains.
+PASS_THRESHOLD = 70
 VERDICTS = ("pass", "partial", "fail", "insufficient_evidence")
 PASSING_VERDICTS = ("pass",)
 ABSTAIN_VERDICT = "insufficient_evidence"
 
 
+def score_pass(score: float) -> bool:
+    """Derive the boolean pass sense from a 0..100 score. Pure."""
+    return score >= PASS_THRESHOLD
+
+
+def score_band(score: float) -> str:
+    """Derive the display band from a 0..100 score. Pure.
+
+    pass    : score >= PASS_THRESHOLD
+    partial : 0 < score < PASS_THRESHOLD   (some credit, not enough to pass)
+    fail    : score <= 0                   (no credit)
+    """
+    if score >= PASS_THRESHOLD:
+        return "pass"
+    if score > 0:
+        return "partial"
+    return "fail"
+
+
 def verdict_implies_pass(verdict: str) -> bool:
-    """Map a categorical verdict to its boolean pass sense. Pure."""
+    """Map a categorical verdict to its boolean pass sense. Pure.
+
+    Retained for backward compatibility: only "pass" is a pass. The current
+    model derives both pass and band from the score instead, but a judge may
+    still emit a categorical verdict and this keeps its pass-sense well-defined.
+    """
     return verdict in PASSING_VERDICTS
+
 
 
 @dataclass(frozen=True)
@@ -707,22 +740,15 @@ def validate_grade(value: dict[str, Any] | None) -> tuple[bool, list[str]]:
         errors.append("unexpected top-level fields: " + ", ".join(unknown_top_level))
     if not isinstance(value.get("overall_pass"), bool):
         errors.append("overall_pass must be boolean")
-    # Optional categorical verdict. The strict output schema makes it
-    # required-but-nullable, so a null verdict means "not supplied" and is
-    # treated exactly like an absent one. When a non-null value is present it
-    # must be a known enum value and must agree with overall_pass (which stays
-    # authoritative/required). "insufficient_evidence" is not a pass.
-    if value.get("verdict") is not None:
-        verdict = value.get("verdict")
-        if verdict not in VERDICTS:
-            errors.append("verdict must be one of " + ", ".join(VERDICTS))
-        elif isinstance(value.get("overall_pass"), bool) and (
-            verdict_implies_pass(verdict) != value["overall_pass"]
-        ):
-            errors.append(
-                f"verdict {verdict!r} disagrees with overall_pass "
-                f"{value['overall_pass']!r}"
-            )
+    # Optional categorical verdict (display-only in the simplified model). The
+    # strict output schema makes it required-but-nullable, so null means "not
+    # supplied". When a non-null value is present it only has to be a known enum
+    # value. It is NOT cross-checked against `overall_pass`: pass and the band
+    # are derived from `score`, so a judge emitting e.g. verdict "partial" with
+    # overall_pass true is no longer a contradiction to reject — the score is
+    # authoritative. (This cross-check previously discarded valid grades.)
+    if value.get("verdict") is not None and value.get("verdict") not in VERDICTS:
+        errors.append("verdict must be one of " + ", ".join(VERDICTS))
     score = value.get("score")
     if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
         errors.append("score must be an integer from 0 to 100")
@@ -892,11 +918,15 @@ def combine_semantic_judges(
         }
 
     scores = [int(judge["result"]["score"]) for judge in deciding_judges]
-    passing_votes = sum(
-        bool(judge["result"]["overall_pass"]) for judge in deciding_judges
-    )
-    consensus_pass = passing_votes >= quorum
+    # Score is authoritative: the consensus score is the median of deciding
+    # judges, and pass + band are DERIVED from it via PASS_THRESHOLD rather than
+    # by counting each judge's self-reported `overall_pass` boolean. (A judge may
+    # report overall_pass inconsistently with its own score; the score wins.)
     consensus_score = round(median(scores))
+    consensus_pass = score_pass(consensus_score)
+    consensus_band = score_band(consensus_score)
+    # For transparency, still note how many judges' OWN score cleared the bar.
+    passing_votes = sum(score_pass(s) for s in scores)
     limitations = [
         limitation
         for judge in deciding_judges
@@ -905,16 +935,21 @@ def combine_semantic_judges(
     limitations.extend(errors)
     consensus = {
         "overall_pass": consensus_pass,
+        "verdict": consensus_band,
         "score": consensus_score,
         "checks": [
             {
                 "id": "semantic-jury",
                 "pass": consensus_pass,
+                "verdict": consensus_band,
                 "points": consensus_score,
                 "notes": (
-                    f"{passing_votes}/{len(deciding_judges)} deciding judges voted "
-                    f"pass ({len(abstaining_judges)} abstained of {requested_count} "
-                    f"requested); deciding scores: {scores}; consensus uses the median."
+                    f"consensus score {consensus_score} (median of {scores}) -> "
+                    f"band {consensus_band!r}, pass={consensus_pass} at threshold "
+                    f"{PASS_THRESHOLD}; {passing_votes}/{len(deciding_judges)} "
+                    f"deciding judges individually cleared the bar "
+                    f"({len(abstaining_judges)} abstained of {requested_count} "
+                    f"requested)."
                 ),
             }
         ],
