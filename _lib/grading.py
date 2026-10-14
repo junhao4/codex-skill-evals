@@ -341,8 +341,10 @@ Read:
 - grades/semantic/input/expected.md
 - workspace/ (the worker's final repository)
 - worker/result.json
+- worker/metrics.json
 - worker/trace.jsonl
 - worker/turns/, for each prompt, response, trace, diagnostic log, and state
+- worker/subagents/, when present (captured subagent rollout traces and manifest.json)
 - git/, for the complete base-relative Git evidence
 - grades/deterministic/result.json, when present
 - run.json

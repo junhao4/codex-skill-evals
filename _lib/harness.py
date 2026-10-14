@@ -62,8 +62,11 @@ from _lib.grading import (  # noqa: E402, F401
     verdict_implies_pass,
 )
 from _lib.trace import (  # noqa: E402, F401
+    capture_subagent_rollouts,
     classify_invocation,
     find_rollout,
+    merge_subagent_metrics,
+    read_rollout_metrics,
     read_skill_snapshot_text,
     read_turn_context,
     trace_metrics,
@@ -399,8 +402,15 @@ def run_trial(
         worker_dir / "trace.jsonl",
         skill_root.name if has_skill else None,
     )
+    subagent_capture = capture_subagent_rollouts(
+        worker_dir / "trace.jsonl",
+        worker_dir / "subagents",
+        Path.home() / ".codex" / "sessions",
+    )
+    metrics = merge_subagent_metrics(metrics, subagent_capture)
     metrics["skill_invocation_mode"] = invocation
     metrics["worker_elapsed_seconds"] = worker_seconds
+    write_json(worker_dir / "metrics.json", metrics)
     final_state = git_state(workspace)
     final_state["worker_exit_code"] = worker_exit_code
     final_state["completed_at"] = now()
@@ -543,6 +553,11 @@ def run_trial(
             "reasoning_output_tokens": metrics.get("reasoning_output_tokens", 0),
             "billed_output_tokens": metrics.get("billed_output_tokens", 0),
         },
+        "parent_tokens": metrics.get("parent_token_usage"),
+        "subagent_tokens": metrics.get("subagent_token_usage"),
+        "subagent_spawn_count": metrics.get("subagent_spawn_count", 0),
+        "subagent_wait_count": metrics.get("subagent_wait_count", 0),
+        "subagent_thread_ids": metrics.get("subagent_thread_ids", []),
         "model": model,
         "resolved_model": metadata.get("resolved_model"),
         "resolved_reasoning_effort": metadata.get("resolved_reasoning_effort"),

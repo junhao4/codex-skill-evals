@@ -70,6 +70,9 @@ from _lib.report import (  # noqa: E402, F401
     write_report,
 )
 from _lib.trace import (  # noqa: E402, F401
+    capture_subagent_rollouts,
+    merge_subagent_metrics,
+    read_rollout_metrics,
     read_skill_snapshot_text,
 )
 

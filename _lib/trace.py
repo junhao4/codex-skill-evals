@@ -1,12 +1,51 @@
-"""Codex JSONL trace parsing, rollout provenance lookup, and skill snapshot reading."""
+"""Codex JSONL trace parsing, rollout provenance lookup, subagent rollout capture, and skill snapshot reading."""
 
 from __future__ import annotations
 
 import json
 import re
-from collections import Counter
+import shutil
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any
+
+from _lib.common import write_json
+
+
+COLLAB_EVENT_TYPES = frozenset(
+    {"collab_tool_call", "CollabAgentToolCall", "collab_agent_tool_call"}
+)
+COLLAB_WAIT_TOOLS = frozenset({"wait", "wait_agent"})
+
+
+def _empty_token_usage() -> dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "uncached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "billed_output_tokens": 0,
+    }
+
+
+def _finalize_token_usage(
+    input_tokens: int,
+    cached_input_tokens: int,
+    cache_write_input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int,
+) -> dict[str, int]:
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_input_tokens,
+        "uncached_input_tokens": max(input_tokens - cached_input_tokens, 0),
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "billed_output_tokens": output_tokens + reasoning_output_tokens,
+    }
 
 
 def trace_thread_id(trace: Path) -> str | None:
@@ -18,10 +57,16 @@ def trace_thread_id(trace: Path) -> str | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") == "thread.started" and isinstance(
             event.get("thread_id"), str
         ):
             return event["thread_id"]
+        if event.get("type") == "session_meta":
+            payload = event.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+                return payload["id"]
     return None
 
 
@@ -88,6 +133,127 @@ def read_skill_snapshot_text(run_dir: Path, metadata: dict[str, Any]) -> str | N
     return skill_md.read_text(encoding="utf-8", errors="replace")
 
 
+def _extract_collab_item(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a collab tool call event across live (`collab_tool_call`) and
+    persisted (`CollabAgentToolCall`) Codex trace schemas.
+
+    Skips `item.started` events so live `--json` streams that emit both
+    `item.started` and `item.completed` for the same tool call are counted once.
+    """
+    if event.get("type") == "item.started":
+        return None
+    for candidate in (event.get("item"), event.get("payload"), event):
+        if not isinstance(candidate, dict):
+            continue
+        cand_type = candidate.get("type")
+        has_collab_signature = isinstance(candidate.get("tool"), str) and isinstance(
+            candidate.get("receiver_thread_ids"), list
+        )
+        if cand_type in COLLAB_EVENT_TYPES or has_collab_signature:
+            receiver_ids = [
+                tid
+                for tid in (candidate.get("receiver_thread_ids") or [])
+                if isinstance(tid, str) and tid
+            ]
+            prompt = candidate.get("prompt")
+            if not isinstance(prompt, str):
+                prompt = (
+                    candidate.get("message")
+                    if isinstance(candidate.get("message"), str)
+                    else None
+                )
+            agents_states = (
+                candidate.get("agents_states")
+                if isinstance(candidate.get("agents_states"), dict)
+                else {}
+            )
+            return {
+                "id": candidate.get("id") if isinstance(candidate.get("id"), str) else None,
+                "tool": candidate.get("tool")
+                if isinstance(candidate.get("tool"), str)
+                else None,
+                "status": candidate.get("status")
+                if isinstance(candidate.get("status"), str)
+                else None,
+                "sender_thread_id": candidate.get("sender_thread_id")
+                if isinstance(candidate.get("sender_thread_id"), str)
+                else None,
+                "receiver_thread_ids": receiver_ids,
+                "prompt": prompt,
+                "agents_states": agents_states,
+            }
+    return None
+
+
+def _summarize_collab_calls(
+    collab_calls: list[dict[str, Any]],
+    default_parent_tid: str | None = None,
+) -> dict[str, Any]:
+    """Summarize normalized collab tool calls into spawn/wait counts and per-child records."""
+    spawn_count = 0
+    wait_count = 0
+    thread_ids: list[str] = []
+    seen_tids: set[str] = set()
+    child_meta: dict[str, dict[str, Any]] = {}
+
+    for call in collab_calls:
+        tool = call.get("tool")
+        receivers = call.get("receiver_thread_ids") or []
+        sender = call.get("sender_thread_id") or default_parent_tid
+        if tool == "spawn_agent":
+            spawn_count += 1
+        elif tool in COLLAB_WAIT_TOOLS:
+            wait_count += 1
+
+        for tid in receivers:
+            if tid not in seen_tids:
+                seen_tids.add(tid)
+                thread_ids.append(tid)
+                child_meta[tid] = {
+                    "thread_id": tid,
+                    "parent_thread_id": sender,
+                    "prompt": None,
+                    "waited": False,
+                    "final_status": None,
+                    "final_message": None,
+                }
+            entry = child_meta[tid]
+            if sender and not entry.get("parent_thread_id"):
+                entry["parent_thread_id"] = sender
+            if tool == "spawn_agent" and call.get("prompt") and not entry.get("prompt"):
+                entry["prompt"] = call["prompt"]
+            if tool in COLLAB_WAIT_TOOLS:
+                entry["waited"] = True
+
+        agents_states = call.get("agents_states") or {}
+        for tid, state in agents_states.items():
+            if not isinstance(tid, str) or not tid or not isinstance(state, dict):
+                continue
+            if tid not in seen_tids:
+                seen_tids.add(tid)
+                thread_ids.append(tid)
+                child_meta[tid] = {
+                    "thread_id": tid,
+                    "parent_thread_id": sender,
+                    "prompt": None,
+                    "waited": tool in COLLAB_WAIT_TOOLS,
+                    "final_status": None,
+                    "final_message": None,
+                }
+            entry = child_meta[tid]
+            if isinstance(state.get("status"), str):
+                entry["final_status"] = state["status"]
+            if isinstance(state.get("message"), str) and state["message"]:
+                entry["final_message"] = state["message"]
+
+    return {
+        "subagent_spawn_count": spawn_count,
+        "subagent_wait_count": wait_count,
+        "subagent_thread_ids": thread_ids,
+        "subagents": [child_meta[tid] for tid in thread_ids],
+    }
+
+
 def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     parse_errors = 0
@@ -104,15 +270,25 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
                 events.append(value)
 
     commands: list[dict[str, Any]] = []
+    collab_calls: list[dict[str, Any]] = []
     input_tokens = 0
     cached_input_tokens = 0
     cache_write_input_tokens = 0
     output_tokens = 0
     reasoning_output_tokens = 0
+    parent_tid: str | None = None
+
     for event in events:
+        if event.get("type") == "thread.started" and isinstance(
+            event.get("thread_id"), str
+        ):
+            parent_tid = event["thread_id"]
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "command_execution":
             commands.append(item)
+        collab = _extract_collab_item(event)
+        if collab is not None:
+            collab_calls.append(collab)
         if event.get("type") == "turn.completed" and isinstance(
             event.get("usage"), dict
         ):
@@ -140,6 +316,15 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
             skill_name.lower() in command.lower() and "skill.md" in command.lower()
             for command in command_texts
         )
+
+    collab_summary = _summarize_collab_calls(collab_calls, default_parent_tid=parent_tid)
+    token_usage = _finalize_token_usage(
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+    )
     return {
         "event_count": len(events),
         "parse_errors": parse_errors,
@@ -152,14 +337,387 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
         "repeated_command_count": repeated,
         "prohibited_commands": prohibited,
         "skill_read_observed": skill_read_observed,
-        "input_tokens": input_tokens,
-        "cached_input_tokens": cached_input_tokens,
-        "cache_write_input_tokens": cache_write_input_tokens,
-        "uncached_input_tokens": max(input_tokens - cached_input_tokens, 0),
-        "output_tokens": output_tokens,
-        "reasoning_output_tokens": reasoning_output_tokens,
-        "billed_output_tokens": output_tokens + reasoning_output_tokens,
+        **token_usage,
+        **collab_summary,
     }
+
+
+def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
+    """Read lineage, model/effort, command counts, nested spawns, and token usage
+    from a persisted Codex rollout JSONL file. Strictly READ-ONLY.
+    """
+    if not rollout.is_file():
+        return {
+            "thread_id": None,
+            "parent_thread_id": None,
+            "depth": None,
+            "agent_nickname": None,
+            "agent_role": None,
+            "model": None,
+            "reasoning_effort": None,
+            "event_count": 0,
+            "parse_errors": 0,
+            "command_count": 0,
+            "failed_command_count": 0,
+            "collab_calls": [],
+            "spawned_thread_ids": [],
+            "token_usage": _empty_token_usage(),
+        }
+
+    thread_id: str | None = None
+    parent_thread_id: str | None = None
+    depth: int | None = None
+    agent_nickname: str | None = None
+    agent_role: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    event_count = 0
+    parse_errors = 0
+    command_count = 0
+    failed_command_count = 0
+    collab_calls: list[dict[str, Any]] = []
+
+    turn_completed_seen = False
+    tc_input = 0
+    tc_cached = 0
+    tc_cache_write = 0
+    tc_output = 0
+    tc_reasoning = 0
+    latest_total_usage: dict[str, Any] | None = None
+
+    for line in rollout.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_count += 1
+        ev_type = event.get("type")
+
+        if ev_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            thread_id = event["thread_id"]
+        elif ev_type == "session_meta":
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                if isinstance(payload.get("id"), str):
+                    thread_id = payload["id"]
+                if isinstance(payload.get("parent_thread_id"), str):
+                    parent_thread_id = payload["parent_thread_id"]
+                if isinstance(payload.get("agent_nickname"), str):
+                    agent_nickname = payload["agent_nickname"]
+                if isinstance(payload.get("agent_role"), str):
+                    agent_role = payload["agent_role"]
+                source = payload.get("source")
+                if isinstance(source, dict):
+                    sub = source.get("subagent")
+                    if isinstance(sub, dict):
+                        spawn = sub.get("thread_spawn")
+                        if isinstance(spawn, dict):
+                            if isinstance(spawn.get("parent_thread_id"), str):
+                                parent_thread_id = spawn["parent_thread_id"]
+                            if isinstance(spawn.get("depth"), int) and not isinstance(
+                                spawn.get("depth"), bool
+                            ):
+                                depth = spawn["depth"]
+                            if isinstance(spawn.get("agent_nickname"), str):
+                                agent_nickname = spawn["agent_nickname"]
+                            if isinstance(spawn.get("agent_role"), str):
+                                agent_role = spawn["agent_role"]
+        elif ev_type == "turn_context":
+            payload = event.get("payload", event)
+            if isinstance(payload, dict):
+                if isinstance(payload.get("model"), str):
+                    model = payload["model"]
+                if isinstance(payload.get("effort"), str):
+                    effort = payload["effort"]
+
+        item = event.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "command_execution"
+            and ev_type != "item.started"
+        ):
+            command_count += 1
+            if item.get("status") == "completed" and item.get("exit_code") not in (
+                None,
+                0,
+            ):
+                failed_command_count += 1
+        elif ev_type == "event_msg":
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                p_type = payload.get("type")
+                if p_type == "exec_command_end":
+                    command_count += 1
+                    if payload.get("exit_code") not in (None, 0):
+                        failed_command_count += 1
+                elif p_type == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict) and isinstance(
+                        info.get("total_token_usage"), dict
+                    ):
+                        latest_total_usage = info["total_token_usage"]
+                    elif isinstance(payload.get("total_token_usage"), dict):
+                        latest_total_usage = payload["total_token_usage"]
+
+        if ev_type == "turn.completed" and isinstance(event.get("usage"), dict):
+            turn_completed_seen = True
+            usage = event["usage"]
+            tc_input += int(usage.get("input_tokens", 0) or 0)
+            tc_cached += int(usage.get("cached_input_tokens", 0) or 0)
+            tc_cache_write += int(usage.get("cache_write_input_tokens", 0) or 0)
+            tc_output += int(usage.get("output_tokens", 0) or 0)
+            tc_reasoning += int(usage.get("reasoning_output_tokens", 0) or 0)
+
+        collab = _extract_collab_item(event)
+        if collab is not None:
+            collab_calls.append(collab)
+
+    if turn_completed_seen:
+        token_usage = _finalize_token_usage(
+            tc_input, tc_cached, tc_cache_write, tc_output, tc_reasoning
+        )
+    elif latest_total_usage is not None:
+        token_usage = _finalize_token_usage(
+            int(latest_total_usage.get("input_tokens", 0) or 0),
+            int(latest_total_usage.get("cached_input_tokens", 0) or 0),
+            int(latest_total_usage.get("cache_write_input_tokens", 0) or 0),
+            int(latest_total_usage.get("output_tokens", 0) or 0),
+            int(latest_total_usage.get("reasoning_output_tokens", 0) or 0),
+        )
+    else:
+        token_usage = _empty_token_usage()
+
+    collab_summary = _summarize_collab_calls(collab_calls, default_parent_tid=thread_id)
+    return {
+        "thread_id": thread_id,
+        "parent_thread_id": parent_thread_id,
+        "depth": depth,
+        "agent_nickname": agent_nickname,
+        "agent_role": agent_role,
+        "model": model,
+        "reasoning_effort": effort,
+        "event_count": event_count,
+        "parse_errors": parse_errors,
+        "command_count": command_count,
+        "failed_command_count": failed_command_count,
+        "collab_calls": collab_calls,
+        "spawned_thread_ids": collab_summary["subagent_thread_ids"],
+        "subagent_spawn_count": collab_summary["subagent_spawn_count"],
+        "subagent_wait_count": collab_summary["subagent_wait_count"],
+        "subagents": collab_summary["subagents"],
+        "token_usage": token_usage,
+    }
+
+
+def capture_subagent_rollouts(
+    parent_trace: Path,
+    subagents_dir: Path,
+    sessions_root: Path,
+) -> dict[str, Any]:
+    """Discover spawned subagent threads in `parent_trace` (and recursively in
+    captured child rollouts), copy their persisted rollouts read-only from
+    `sessions_root` into `subagents_dir`, and return aggregated subagent metrics.
+
+    Strictly READ-ONLY on `sessions_root`. If no subagents were spawned, does not
+    create `subagents_dir`. Missing rollout files degrade gracefully with
+    `rollout_captured: False`.
+    """
+    parent_metrics = trace_metrics(parent_trace)
+    parent_tid = trace_thread_id(parent_trace)
+    total_spawn_count = int(parent_metrics.get("subagent_spawn_count", 0))
+    total_wait_count = int(parent_metrics.get("subagent_wait_count", 0))
+    initial_children = list(parent_metrics.get("subagent").values()) if isinstance(parent_metrics.get("subagent"), dict) else list(parent_metrics.get("subagents", []))
+
+    if total_spawn_count == 0 and not initial_children:
+        return {
+            "parent_thread_id": parent_tid,
+            "subagent_spawn_count": 0,
+            "subagent_wait_count": 0,
+            "subagent_thread_ids": [],
+            "subagent_token_usage": _empty_token_usage(),
+            "subagents": [],
+        }
+
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    queue: deque[dict[str, Any]] = deque(initial_children)
+    visited: set[str] = set()
+    if parent_tid:
+        visited.add(parent_tid)
+
+    all_thread_ids: list[str] = []
+    subagents_list: list[dict[str, Any]] = []
+    depth_by_tid: dict[str, int] = {}
+    if parent_tid:
+        depth_by_tid[parent_tid] = 0
+
+    tot_input = 0
+    tot_cached = 0
+    tot_cache_write = 0
+    tot_output = 0
+    tot_reasoning = 0
+
+    while queue:
+        stub = queue.popleft()
+        tid = stub.get("thread_id")
+        if not isinstance(tid, str) or not tid or tid in visited:
+            continue
+        visited.add(tid)
+        all_thread_ids.append(tid)
+
+        inferred_parent = stub.get("parent_thread_id") or parent_tid
+        inferred_depth = depth_by_tid.get(inferred_parent, 0) + 1 if inferred_parent else 1
+
+        source_rollout = find_rollout(tid, sessions_root)
+        if source_rollout is not None and source_rollout.is_file():
+            dest_rollout = subagents_dir / f"{tid}.jsonl"
+            shutil.copyfile(source_rollout, dest_rollout)
+            info = read_rollout_metrics(dest_rollout)
+            resolved_parent = info["parent_thread_id"] or inferred_parent
+            resolved_depth = (
+                info["depth"]
+                if info["depth"] is not None
+                else (
+                    depth_by_tid.get(resolved_parent, 0) + 1
+                    if resolved_parent
+                    else inferred_depth
+                )
+            )
+            depth_by_tid[tid] = resolved_depth
+            usage = info["token_usage"]
+            tot_input += usage["input_tokens"]
+            tot_cached += usage["cached_input_tokens"]
+            tot_cache_write += usage["cache_write_input_tokens"]
+            tot_output += usage["output_tokens"]
+            tot_reasoning += usage["reasoning_output_tokens"]
+
+            record = {
+                "thread_id": tid,
+                "parent_thread_id": resolved_parent,
+                "depth": resolved_depth,
+                "agent_nickname": info["agent_nickname"],
+                "agent_role": info["agent_role"],
+                "model": info["model"],
+                "reasoning_effort": info["reasoning_effort"],
+                "prompt": stub.get("prompt"),
+                "waited": bool(stub.get("waited", False)),
+                "final_status": stub.get("final_status"),
+                "final_message": stub.get("final_message"),
+                "rollout_captured": True,
+                "rollout_file": f"subagents/{tid}.jsonl",
+                "command_count": info["command_count"],
+                "failed_command_count": info["failed_command_count"],
+                "token_usage": usage,
+            }
+            subagents_list.append(record)
+
+            # Enqueue any nested sub-subagents spawned by this child rollout
+            total_spawn_count += int(info.get("subagent_spawn_count", 0))
+            total_wait_count += int(info.get("subagent_wait_count", 0))
+            for nested_stub in info.get("subagents", []):
+                nested_tid = nested_stub.get("thread_id")
+                if isinstance(nested_tid, str) and nested_tid and nested_tid not in visited:
+                    if not nested_stub.get("parent_thread_id"):
+                        nested_stub["parent_thread_id"] = tid
+                    queue.append(nested_stub)
+        else:
+            depth_by_tid[tid] = inferred_depth
+            record = {
+                "thread_id": tid,
+                "parent_thread_id": inferred_parent,
+                "depth": inferred_depth,
+                "agent_nickname": None,
+                "agent_role": None,
+                "model": None,
+                "reasoning_effort": None,
+                "prompt": stub.get("prompt"),
+                "waited": bool(stub.get("waited", False)),
+                "final_status": stub.get("final_status"),
+                "final_message": stub.get("final_message"),
+                "rollout_captured": False,
+                "rollout_file": None,
+                "command_count": 0,
+                "failed_command_count": 0,
+                "token_usage": _empty_token_usage(),
+            }
+            subagents_list.append(record)
+
+    subagent_token_usage = _finalize_token_usage(
+        tot_input, tot_cached, tot_cache_write, tot_output, tot_reasoning
+    )
+    manifest = {
+        "parent_thread_id": parent_tid,
+        "subagent_spawn_count": total_spawn_count,
+        "subagent_wait_count": total_wait_count,
+        "subagent_thread_ids": all_thread_ids,
+        "subagent_token_usage": subagent_token_usage,
+        "subagents": subagents_list,
+    }
+    write_json(subagents_dir / "manifest.json", manifest)
+    return manifest
+
+
+def merge_subagent_metrics(
+    metrics: dict[str, Any],
+    subagent_capture: dict[str, Any],
+) -> dict[str, Any]:
+    """Roll up parent + subagent token usage in `metrics` while preserving both
+    `parent_token_usage` and `subagent_token_usage` breakdowns.
+    """
+    merged = dict(metrics)
+    parent_tokens = _finalize_token_usage(
+        int(merged.get("input_tokens", 0) or 0),
+        int(merged.get("cached_input_tokens", 0) or 0),
+        int(merged.get("cache_write_input_tokens", 0) or 0),
+        int(merged.get("output_tokens", 0) or 0),
+        int(merged.get("reasoning_output_tokens", 0) or 0),
+    )
+    sub_tokens_raw = subagent_capture.get("subagent_token_usage") or _empty_token_usage()
+    sub_tokens = _finalize_token_usage(
+        int(sub_tokens_raw.get("input_tokens", 0) or 0),
+        int(sub_tokens_raw.get("cached_input_tokens", 0) or 0),
+        int(sub_tokens_raw.get("cache_write_input_tokens", 0) or 0),
+        int(sub_tokens_raw.get("output_tokens", 0) or 0),
+        int(sub_tokens_raw.get("reasoning_output_tokens", 0) or 0),
+    )
+    total_tokens = _finalize_token_usage(
+        parent_tokens["input_tokens"] + sub_tokens["input_tokens"],
+        parent_tokens["cached_input_tokens"] + sub_tokens["cached_input_tokens"],
+        parent_tokens["cache_write_input_tokens"]
+        + sub_tokens["cache_write_input_tokens"],
+        parent_tokens["output_tokens"] + sub_tokens["output_tokens"],
+        parent_tokens["reasoning_output_tokens"]
+        + sub_tokens["reasoning_output_tokens"],
+    )
+
+    merged.update(total_tokens)
+    merged["parent_token_usage"] = parent_tokens
+    merged["subagent_token_usage"] = sub_tokens
+    merged["subagent_spawn_count"] = int(
+        subagent_capture.get(
+            "subagent_spawn_count", merged.get("subagent_spawn_count", 0)
+        )
+        or 0
+    )
+    merged["subagent_wait_count"] = int(
+        subagent_capture.get(
+            "subagent_wait_count", merged.get("subagent_wait_count", 0)
+        )
+        or 0
+    )
+    merged["subagent_thread_ids"] = list(
+        subagent_capture.get(
+            "subagent_thread_ids", merged.get("subagent_thread_ids", [])
+        )
+    )
+    merged["subagents"] = list(
+        subagent_capture.get("subagents", merged.get("subagents", []))
+    )
+    return merged
 
 
 def classify_invocation(
@@ -178,3 +736,4 @@ def classify_invocation(
         name in prompt for prompt in prompt_texts for name in explicit_names
     )
     return "explicit" if explicitly_named else "implicit-candidate"
+
