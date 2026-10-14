@@ -848,6 +848,17 @@ def run_checker(
     if completed.returncode != 0:
         errors.append(f"grader exited with code {completed.returncode}")
     status = "completed" if completed.returncode == 0 and valid else "invalid"
+    if status == "completed" and isinstance(result, dict):
+        # Score is authoritative for deterministic graders just as for the
+        # semantic jury: derive overall_pass and the display band from score so
+        # a check.py that sets overall_pass = all(c["pass"] ...) cannot report
+        # Score 80 | Pass No.
+        score = int(result["score"])
+        result = {
+            **result,
+            "overall_pass": score_pass(score),
+            "verdict": score_band(score),
+        }
     wrapped = {
         "status": status,
         "exit_code": completed.returncode,
@@ -988,7 +999,7 @@ def run_semantic_grader(
     shutil.copy2(case.expected, grader_input / "expected.md")
     shutil.copy2(schema, grader_input / "grade.schema.json")
 
-    prompt = """Evaluate the completed worker trial. Do not modify files.
+    prompt = f"""Evaluate the completed worker trial. Do not modify files.
 
 Read:
 - grades/semantic/input/expected.md
@@ -1001,8 +1012,11 @@ Read:
 - run.json
 
 Use only observable evidence. Missing evidence is a limitation, not success.
-Return only JSON matching grades/semantic/input/grade.schema.json. The score must equal
-the sum of checks[].points. Explain every deduction in checks[].notes.
+Return only JSON matching grades/semantic/input/grade.schema.json.
+`score` (0..100) is authoritative (`>= {PASS_THRESHOLD}` passes). Record points earned per
+criterion in `checks[].points` and explain every deduction in `checks[].notes`. If an
+essential pass condition or hard gate in `expected.md` fails, cap `score` below
+{PASS_THRESHOLD} (or at 0 for a complete disqualifier) even if other criteria earned points.
 """
     if judge_count < 1:
         raise HarnessError("semantic judge count must be at least 1")
@@ -1113,14 +1127,28 @@ def classify_invocation(
     return "explicit" if explicitly_named else "implicit-candidate"
 
 
+def _grade_passed(grade: dict[str, Any]) -> bool:
+    """Return whether a completed grader passed, using `score >= PASS_THRESHOLD`
+    as the single source of truth when a numeric score is present."""
+    result = grade.get("result")
+    if not isinstance(result, dict):
+        return False
+    score = result.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        return score_pass(int(score))
+    return bool(result.get("overall_pass"))
+
+
 def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
     """Combine deterministic and semantic grades into the trial verdict.
 
     Pure (no I/O). A grade dict has `status` and `result`. Only grades whose
     status is not "not_requested" count. `graders_valid` requires at least one
     requested grade and all requested grades "completed"; `graders_pass`
-    additionally requires every requested result's `overall_pass`. The headline
-    prefers the semantic result when present, else the deterministic result.
+    requires every requested result's `score >= PASS_THRESHOLD` (`score_pass`).
+    When both graders produce a result, `headline` uses the lower-scoring result
+    (`min(deterministic_score, semantic_score)`) so a failing grader is never
+    masked by a passing one.
     """
     requested_grades = [
         grade
@@ -1131,7 +1159,7 @@ def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
         grade["status"] == "completed" for grade in requested_grades
     )
     graders_pass = graders_valid and all(
-        bool(grade["result"].get("overall_pass")) for grade in requested_grades
+        _grade_passed(grade) for grade in requested_grades
     )
     # A trial "needs review" when no requested grader errored outright but at
     # least one reached the distinct `needs_review` terminal state (jury
@@ -1148,9 +1176,34 @@ def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
     )
     deterministic_result = deterministic.get("result")
     semantic_result = semantic.get("result")
-    headline = (
-        semantic_result if isinstance(semantic_result, dict) else deterministic_result
-    )
+    if isinstance(deterministic_result, dict) and isinstance(semantic_result, dict):
+        det_score = deterministic_result.get("score")
+        sem_score = semantic_result.get("score")
+        if (
+            isinstance(det_score, (int, float))
+            and not isinstance(det_score, bool)
+            and isinstance(sem_score, (int, float))
+            and not isinstance(sem_score, bool)
+            and det_score < sem_score
+        ):
+            chosen = deterministic_result
+        else:
+            chosen = semantic_result
+    elif isinstance(semantic_result, dict):
+        chosen = semantic_result
+    elif isinstance(deterministic_result, dict):
+        chosen = deterministic_result
+    else:
+        chosen = None
+
+    if isinstance(chosen, dict):
+        headline = dict(chosen)
+        raw_score = headline.get("score")
+        if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
+            headline["overall_pass"] = score_pass(int(raw_score))
+            headline["verdict"] = score_band(int(raw_score))
+    else:
+        headline = None
     return {
         "graders_valid": graders_valid,
         "graders_pass": graders_pass,

@@ -123,12 +123,17 @@ Example:
 3. Respects scope and dependency boundaries — 15 points
 4. Runs verification and reports the result honestly — 20 points
 
-Essential pass conditions: the defect is fixed, the regression test passes,
-and no prohibited files change.
+Essential pass conditions (cap `score` below 70, or at 0 for a disqualifier, if violated):
+- The defect is fixed and the regression test passes.
+- No prohibited files outside the target module are modified (0 if violated).
 ```
 
-Make the criteria total 100 points and state essential pass conditions
-separately. The worker cannot see this file.
+Make the criteria total 100 points and state any essential pass conditions or
+hard gates explicitly. Both semantic and deterministic graders use `score`
+(`0..100`) as the single source of truth (`score >= 70` passes). If an
+essential condition fails, the grader should cap `score` below `70` (or at `0`
+for a complete disqualifier) even if other criteria earned points. The worker
+cannot see this file.
 
 ### `check.py`: what deterministic grading assesses
 
@@ -181,8 +186,18 @@ It must print exactly one grade JSON object:
 }
 ```
 
-The output must match [`_lib/grade.schema.json`](../_lib/grade.schema.json), and
-the top-level `score` must equal the sum of all `checks[].points`.
+The output must match [`_lib/grade.schema.json`](../_lib/grade.schema.json).
+`score` (`0..100`) is authoritative: the harness derives `overall_pass`
+(`score >= 70`) and the display band (`pass` for `70..100`, `partial` for
+`1..69`, `fail` for `0`) directly from `score`. `checks[].points` record the
+points earned per check and do not need to sum to `score`.
+
+To enforce a hard gate ("instafail") in `check.py` — for example, failing
+immediately if the worker modifies prohibited files or breaks compilation:
+- either weight that check `> 30` points so failing it drops a 100-point rubric
+  below `70`, or
+- cap `score` at `0` (or `min(score, 69)`) when the gate check fails while
+  keeping per-check `points` on the remaining checks for diagnostic visibility.
 
 Keep `_lib/` limited to generic harness infrastructure. Project-specific facts,
 such as source-directory names, frameworks, endpoints, user roles, or required

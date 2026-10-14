@@ -52,8 +52,10 @@ def test_grade_outcome_both_pass():
     out = grade_outcome(det, sem)
     assert out["graders_valid"] is True
     assert out["graders_pass"] is True
-    # headline prefers semantic
+    # headline takes min(det_score, sem_score) = min(100, 90) = 90
     assert out["headline"]["score"] == 90
+    assert out["headline"]["overall_pass"] is True
+    assert out["headline"]["verdict"] == "pass"
 
 
 def test_grade_outcome_one_fails():
@@ -62,6 +64,32 @@ def test_grade_outcome_one_fails():
     out = grade_outcome(det, sem)
     assert out["graders_valid"] is True
     assert out["graders_pass"] is False
+    # headline uses the lower-scoring result so a failing deterministic grader
+    # is never hidden behind a passing semantic score
+    assert out["headline"]["score"] == 40
+    assert out["headline"]["overall_pass"] is False
+    assert out["headline"]["verdict"] == "partial"
+
+
+def test_grade_outcome_score_is_authoritative_over_self_reported_bool():
+    # A deterministic checker that sets overall_pass=False via all(c["pass"])
+    # while scoring 80 (>= 70) still passes under the unified score >= 70 rule.
+    det = _grade("completed", False, 80)
+    out = grade_outcome(det, NR)
+    assert out["graders_valid"] is True
+    assert out["graders_pass"] is True
+    assert out["headline"]["score"] == 80
+    assert out["headline"]["overall_pass"] is True
+    assert out["headline"]["verdict"] == "pass"
+
+    # Conversely, overall_pass=True with score 55 (< 70) fails.
+    det_low = _grade("completed", True, 55)
+    out_low = grade_outcome(det_low, NR)
+    assert out_low["graders_valid"] is True
+    assert out_low["graders_pass"] is False
+    assert out_low["headline"]["score"] == 55
+    assert out_low["headline"]["overall_pass"] is False
+    assert out_low["headline"]["verdict"] == "partial"
 
 
 def test_grade_outcome_invalid_when_a_requested_grader_errored():
@@ -85,3 +113,4 @@ def test_grade_outcome_nothing_requested_is_invalid():
     assert out["graders_valid"] is False
     assert out["graders_pass"] is False
     assert out["headline"] is None
+

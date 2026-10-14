@@ -325,3 +325,49 @@ def test_grade_outcome_no_needs_review_when_all_decided():
     out = grade_outcome(det, sem)
     assert out["needs_review"] is False
     assert out["graders_pass"] is True
+
+
+def test_run_checker_normalizes_overall_pass_and_verdict_from_score(tmp_path):
+    from _lib.harness import Case, read_json, run_checker
+
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    checker = case_dir / "check.py"
+    # Emits score=80 with overall_pass=False (as if using all(c["pass"]))
+    checker.write_text(
+        'import json\n'
+        'print(json.dumps({\n'
+        '  "overall_pass": False,\n'
+        '  "score": 80,\n'
+        '  "checks": [\n'
+        '    {"id": "c1", "pass": True, "points": 80, "notes": "main ok"},\n'
+        '    {"id": "c2", "pass": False, "points": 0, "notes": "minor miss"}\n'
+        '  ],\n'
+        '  "limitations": []\n'
+        '}))\n',
+        encoding="utf-8",
+    )
+    case = Case(
+        name="demo",
+        root=case_dir,
+        prompt=case_dir / "prompt.md",
+        fixture=case_dir / "fixture",
+        expected=None,
+        checker=checker,
+        supporting_skills=(),
+        interactions=(),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    wrapped = run_checker(case, workspace, run_dir, timeout=10)
+    assert wrapped["status"] == "completed"
+    assert wrapped["result"]["score"] == 80
+    assert wrapped["result"]["overall_pass"] is True
+    assert wrapped["result"]["verdict"] == "pass"
+    persisted = read_json(run_dir / "grades" / "deterministic" / "result.json")
+    assert persisted["result"]["overall_pass"] is True
+    assert persisted["result"]["verdict"] == "pass"
+
