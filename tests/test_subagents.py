@@ -11,9 +11,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from _lib.harness import (  # noqa: E402
+    capture_main_rollout,
     capture_subagent_rollouts,
     merge_subagent_metrics,
     read_rollout_metrics,
+    sanitize_trace_jsonl,
     trace_metrics,
 )
 
@@ -433,3 +435,217 @@ def test_merge_subagent_metrics_rolls_up_tokens_and_preserves_breakdown():
     assert merged["subagent_token_usage"]["billed_output_tokens"] == 300
     assert merged["subagent_spawn_count"] == 2
     assert merged["subagent_thread_ids"] == ["child-01", "grandchild-01"]
+
+
+def test_sanitize_trace_jsonl_strips_only_encrypted_content(tmp_path):
+    source = _write_jsonl(
+        tmp_path / "raw-rollout.jsonl",
+        [
+            {
+                "type": "session_meta",
+                "payload": {"id": "main-01", "base_instructions": {"text": "sys"}},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<permissions instructions>workspace-write</permissions instructions>",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Checking files"}],
+                    "content": None,
+                    "encrypted_content": "gAAAAABp3huge_opaque_ciphertext_blob==",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAAABp3compaction_blob==",
+                },
+            },
+        ],
+    )
+    dest = tmp_path / "sanitized.jsonl"
+    sanitize_trace_jsonl(source, dest)
+    lines = [
+        json.loads(line)
+        for line in dest.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 4
+    assert lines[0]["payload"]["id"] == "main-01"
+    assert "<permissions instructions>" in lines[1]["payload"]["content"][0]["text"]
+    assert lines[2]["payload"]["summary"] == [
+        {"type": "summary_text", "text": "Checking files"}
+    ]
+    assert "encrypted_content" not in lines[2]["payload"]
+    assert "encrypted_content" not in lines[3]["payload"]
+
+
+def test_capture_main_rollout_prefers_persisted_rollout_and_falls_back(tmp_path):
+    sessions_day = tmp_path / "sessions" / "2026" / "10" / "14"
+    turn1 = _write_jsonl(
+        tmp_path / "turns" / "turn-01" / "trace.jsonl",
+        [{"type": "thread.started", "thread_id": "main-01"}],
+    )
+    _write_jsonl(
+        sessions_day / "rollout-2026-10-14T12-00-00-main-01.jsonl",
+        [
+            {"type": "session_meta", "payload": {"id": "main-01"}},
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4", "effort": "high"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Plan"}],
+                    "encrypted_content": "secret_blob",
+                },
+            },
+        ],
+    )
+    dest = tmp_path / "worker" / "trace.jsonl"
+    used_rollout = capture_main_rollout(
+        [turn1], dest, "main-01", tmp_path / "sessions"
+    )
+    assert used_rollout is not None
+    records = [
+        json.loads(line)
+        for line in dest.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [r["type"] for r in records] == [
+        "session_meta",
+        "turn_context",
+        "response_item",
+    ]
+    assert "encrypted_content" not in records[2]["payload"]
+
+    # Fallback when rollout file is absent
+    dest_fallback = tmp_path / "worker-fallback" / "trace.jsonl"
+    used_rollout_missing = capture_main_rollout(
+        [turn1], dest_fallback, "missing-thread", tmp_path / "sessions"
+    )
+    assert used_rollout_missing is None
+    fallback_records = [
+        json.loads(line)
+        for line in dest_fallback.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert fallback_records == [{"type": "thread.started", "thread_id": "main-01"}]
+
+
+def test_trace_metrics_parses_persisted_rollout_format(tmp_path):
+    rollout_trace = _write_jsonl(
+        tmp_path / "trace.jsonl",
+        [
+            {"type": "session_meta", "payload": {"id": "main-01"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "main-01",
+                    "item": {
+                        "type": "CommandExecution",
+                        "command": [
+                            "/bin/zsh",
+                            "-lc",
+                            "cat .agents/skills/demo-skill/SKILL.md",
+                        ],
+                        "exit_code": 0,
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "main-01",
+                    "item": {
+                        "type": "CommandExecution",
+                        "command": ["/bin/zsh", "-lc", "git reset --hard"],
+                        "exit_code": 1,
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "main-01",
+                    "item": {
+                        "type": "CollabAgentToolCall",
+                        "tool": "spawn_agent",
+                        "status": "completed",
+                        "sender_thread_id": "main-01",
+                        "receiver_thread_ids": ["child-01"],
+                        "prompt": "Audit code",
+                        "agents_states": {"child-01": "pending_init"},
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "main-01",
+                    "item": {
+                        "type": "CollabAgentToolCall",
+                        "tool": "wait",
+                        "status": "completed",
+                        "sender_thread_id": "main-01",
+                        "receiver_thread_ids": ["child-01"],
+                        "agents_states": {
+                            "child-01": {"completed": "Audit finished cleanly."}
+                        },
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 8000,
+                            "cached_input_tokens": 6000,
+                            "output_tokens": 500,
+                            "reasoning_output_tokens": 200,
+                        }
+                    },
+                },
+            },
+        ],
+    )
+    m = trace_metrics(rollout_trace, "demo-skill")
+    assert m["command_count"] == 2
+    assert m["failed_command_count"] == 1
+    assert m["skill_read_observed"] is True
+    assert m["prohibited_commands"] == ["/bin/zsh -lc git reset --hard"]
+    assert m["input_tokens"] == 8000
+    assert m["cached_input_tokens"] == 6000
+    assert m["uncached_input_tokens"] == 2000
+    assert m["output_tokens"] == 500
+    assert m["reasoning_output_tokens"] == 200
+    assert m["billed_output_tokens"] == 700
+    assert m["subagent_spawn_count"] == 1
+    assert m["subagent_wait_count"] == 1
+    assert m["subagent_thread_ids"] == ["child-01"]
+    assert m["subagents"][0]["parent_thread_id"] == "main-01"
+    assert m["subagents"][0]["waited"] is True
+    assert m["subagents"][0]["final_status"] == "completed"
+    assert m["subagents"][0]["final_message"] == "Audit finished cleanly."
+

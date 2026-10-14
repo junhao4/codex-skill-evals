@@ -45,14 +45,18 @@ Each trial directory contains:
 
 | Output | Meaning |
 |---|---|
-| `result.json` | Final trial result, separate grader scores, model, and a `tokens` breakdown (uncached/cached input, output, reasoning, billed output) |
-| `run.json` | Trial inputs, configuration, initial Git state, invocation mode, turn metadata, thread id, and resolved model/reasoning effort read from the rollout |
+| `result.json` | Final trial result, separate grader scores, model, and a `tokens` breakdown (uncached/cached input, output, reasoning, billed output; automatically rolls up parent + spawned subagent usage when subagents ran) |
+| `run.json` | Trial inputs, configuration, initial Git state, skill snapshot paths, invocation mode, turn metadata, thread id, and resolved model/reasoning effort read from the rollout |
+| `skill-snapshot/` | Immutable copy of the injected target skill (and any supporting skills) captured at trial start for `eval.py compare` |
 | `workspace/` | Final file snapshot left by the worker; its temporary `.git/` is removed after the graders finish |
-| `worker/result.json` | Worker exit status, metrics, final Git state, protected-input checks, and untracked paths |
-| `worker/trace.jsonl` | Combined worker events and tool calls from every turn |
+| `worker/result.json` | Worker exit status, rolled-up metrics, final Git state, protected-input checks, and untracked paths |
+| `worker/metrics.json` | Normalized trace and token metrics, including `parent_token_usage`, `subagent_token_usage`, `subagent_spawn_count`, `subagent_wait_count`, `subagent_thread_ids`, and `subagents` summary records |
+| `worker/trace.jsonl` | Read-only copy of the worker's persisted session rollout from `~/.codex/sessions/` (with only opaque `encrypted_content` ciphertext stripped), or concatenated per-turn `codex exec --json` stdout traces when no rollout file exists |
+| `worker/subagents/manifest.json` | Created when the worker spawns subagents; records parent/child lineage (`depth`, `parent_thread_id`), agent role/nickname, model, prompt, wait status, final status/message, and per-subagent token usage |
+| `worker/subagents/<thread-id>.jsonl` | Read-only copy of each spawned child (or nested grandchild) rollout captured from `~/.codex/sessions/` when available, with only `encrypted_content` stripped |
 | `worker/turns/turn-NN/prompt.md` | Exact user message for one worker turn |
 | `worker/turns/turn-NN/response.md` | Worker response for that turn |
-| `worker/turns/turn-NN/trace.jsonl` | Events and tool calls from that turn |
+| `worker/turns/turn-NN/trace.jsonl` | Live `codex exec --json` stdout stream for that turn |
 | `worker/turns/turn-NN/stderr.log` | Diagnostics from that turn |
 | `worker/turns/turn-NN/state.json` | Git state immediately after that turn |
 | `git/changes.patch` | All final tracked changes compared with the prepared workspace base |

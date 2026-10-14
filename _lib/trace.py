@@ -4,18 +4,74 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any
 
-from _lib.common import write_json
+from _lib.common import concatenate_files, write_json
 
 
 COLLAB_EVENT_TYPES = frozenset(
     {"collab_tool_call", "CollabAgentToolCall", "collab_agent_tool_call"}
 )
 COLLAB_WAIT_TOOLS = frozenset({"wait", "wait_agent"})
+
+
+def _strip_encrypted_content(value: Any) -> Any:
+    """Recursively strip opaque `encrypted_content` fields while preserving all other data."""
+    if isinstance(value, dict):
+        return {
+            k: _strip_encrypted_content(v)
+            for k, v in value.items()
+            if k != "encrypted_content"
+        }
+    if isinstance(value, list):
+        return [_strip_encrypted_content(item) for item in value]
+    return value
+
+
+def sanitize_trace_jsonl(source: Path, dest: Path) -> None:
+    """Copy a JSONL trace or rollout from `source` to `dest`, stripping only
+    opaque `encrypted_content` ciphertext while preserving every record and other field.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    out_lines: list[str] = []
+    for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            out_lines.append(line)
+            continue
+        cleaned = _strip_encrypted_content(parsed)
+        out_lines.append(json.dumps(cleaned, ensure_ascii=False))
+    dest.write_text(
+        ("\n".join(out_lines) + "\n") if out_lines else "",
+        encoding="utf-8",
+    )
+
+
+def capture_main_rollout(
+    turn_traces: list[Path],
+    dest_trace: Path,
+    thread_id: str | None,
+    sessions_root: Path,
+) -> Path | None:
+    """Write `dest_trace` from the persisted session rollout for `thread_id`
+    (stripping `encrypted_content`), or fall back to concatenating `turn_traces`
+    when no persisted rollout exists. Strictly READ-ONLY on `sessions_root`.
+    Returns the source rollout path when found, or None when falling back.
+    """
+    dest_trace.parent.mkdir(parents=True, exist_ok=True)
+    rollout = find_rollout(thread_id, sessions_root)
+    if rollout is not None and rollout.is_file():
+        sanitize_trace_jsonl(rollout, dest_trace)
+        return rollout
+    concatenate_files(turn_traces, dest_trace)
+    if dest_trace.is_file():
+        sanitize_trace_jsonl(dest_trace, dest_trace)
+    return None
 
 
 def _empty_token_usage() -> dict[str, int]:
@@ -133,6 +189,65 @@ def read_skill_snapshot_text(run_dir: Path, metadata: dict[str, Any]) -> str | N
     return skill_md.read_text(encoding="utf-8", errors="replace")
 
 
+def _normalize_command_text(raw_command: Any) -> str:
+    if isinstance(raw_command, list):
+        return " ".join(str(part) for part in raw_command)
+    if raw_command is None:
+        return ""
+    return str(raw_command)
+
+
+def _extract_command_item(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a command execution event across live (`command_execution`) and
+    persisted rollout (`event_msg:item_completed` `CommandExecution` / `exec_command_end`)
+    Codex trace schemas.
+
+    Skips `item.started` events so live `--json` streams that emit both
+    `item.started` and `item.completed` for the same command are counted once.
+    """
+    ev_type = event.get("type")
+    if ev_type == "item.started":
+        return None
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") in (
+        "command_execution",
+        "CommandExecution",
+    ):
+        status = item.get("status")
+        return {
+            "command": _normalize_command_text(item.get("command")),
+            "status": str(status).lower() if isinstance(status, str) else "completed",
+            "exit_code": item.get("exit_code"),
+        }
+    if ev_type == "event_msg":
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            p_type = payload.get("type")
+            if p_type == "item_completed":
+                p_item = payload.get("item")
+                if isinstance(p_item, dict) and p_item.get("type") in (
+                    "CommandExecution",
+                    "command_execution",
+                ):
+                    status = p_item.get("status")
+                    return {
+                        "command": _normalize_command_text(p_item.get("command")),
+                        "status": (
+                            str(status).lower()
+                            if isinstance(status, str)
+                            else "completed"
+                        ),
+                        "exit_code": p_item.get("exit_code"),
+                    }
+            elif p_type == "exec_command_end":
+                return {
+                    "command": _normalize_command_text(payload.get("command")),
+                    "status": "completed",
+                    "exit_code": payload.get("exit_code"),
+                }
+    return None
+
+
 def _extract_collab_item(event: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize a collab tool call event across live (`collab_tool_call`) and
     persisted (`CollabAgentToolCall`) Codex trace schemas.
@@ -142,18 +257,33 @@ def _extract_collab_item(event: dict[str, Any]) -> dict[str, Any] | None:
     """
     if event.get("type") == "item.started":
         return None
-    for candidate in (event.get("item"), event.get("payload"), event):
+    payload = event.get("payload")
+    payload_item = payload.get("item") if isinstance(payload, dict) else None
+    for candidate in (event.get("item"), payload_item, payload, event):
         if not isinstance(candidate, dict):
             continue
         cand_type = candidate.get("type")
-        has_collab_signature = isinstance(candidate.get("tool"), str) and isinstance(
-            candidate.get("receiver_thread_ids"), list
+        has_collab_signature = isinstance(candidate.get("tool"), str) and (
+            isinstance(candidate.get("receiver_thread_ids"), list)
+            or isinstance(candidate.get("targets"), list)
+            or isinstance(candidate.get("target_thread_id"), str)
         )
         if cand_type in COLLAB_EVENT_TYPES or has_collab_signature:
+            raw_receivers = (
+                candidate.get("receiver_thread_ids")
+                if isinstance(candidate.get("receiver_thread_ids"), list)
+                else (
+                    candidate.get("targets")
+                    if isinstance(candidate.get("targets"), list)
+                    else (
+                        [candidate["target_thread_id"]]
+                        if isinstance(candidate.get("target_thread_id"), str)
+                        else []
+                    )
+                )
+            )
             receiver_ids = [
-                tid
-                for tid in (candidate.get("receiver_thread_ids") or [])
-                if isinstance(tid, str) and tid
+                tid for tid in raw_receivers if isinstance(tid, str) and tid
             ]
             prompt = candidate.get("prompt")
             if not isinstance(prompt, str):
@@ -227,7 +357,9 @@ def _summarize_collab_calls(
 
         agents_states = call.get("agents_states") or {}
         for tid, state in agents_states.items():
-            if not isinstance(tid, str) or not tid or not isinstance(state, dict):
+            if not isinstance(tid, str) or not tid:
+                continue
+            if not isinstance(state, (dict, str)):
                 continue
             if tid not in seen_tids:
                 seen_tids.add(tid)
@@ -241,10 +373,20 @@ def _summarize_collab_calls(
                     "final_message": None,
                 }
             entry = child_meta[tid]
-            if isinstance(state.get("status"), str):
-                entry["final_status"] = state["status"]
-            if isinstance(state.get("message"), str) and state["message"]:
-                entry["final_message"] = state["message"]
+            if isinstance(state, str) and state:
+                entry["final_status"] = state
+            elif isinstance(state, dict):
+                if isinstance(state.get("status"), str):
+                    entry["final_status"] = state["status"]
+                    if isinstance(state.get("message"), str) and state["message"]:
+                        entry["final_message"] = state["message"]
+                elif len(state) == 1:
+                    # Persisted rollout Rust-enum shape, e.g. {"completed": "<msg>"}
+                    st_key, st_val = next(iter(state.items()))
+                    if isinstance(st_key, str) and st_key:
+                        entry["final_status"] = st_key
+                    if isinstance(st_val, str) and st_val:
+                        entry["final_message"] = st_val
 
     return {
         "subagent_spawn_count": spawn_count,
@@ -271,27 +413,34 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
 
     commands: list[dict[str, Any]] = []
     collab_calls: list[dict[str, Any]] = []
+    turn_completed_seen = False
     input_tokens = 0
     cached_input_tokens = 0
     cache_write_input_tokens = 0
     output_tokens = 0
     reasoning_output_tokens = 0
+    latest_total_usage: dict[str, Any] | None = None
     parent_tid: str | None = None
 
     for event in events:
-        if event.get("type") == "thread.started" and isinstance(
-            event.get("thread_id"), str
-        ):
+        ev_type = event.get("type")
+        if ev_type == "thread.started" and isinstance(event.get("thread_id"), str):
             parent_tid = event["thread_id"]
-        item = event.get("item")
-        if isinstance(item, dict) and item.get("type") == "command_execution":
-            commands.append(item)
+        elif ev_type == "session_meta":
+            payload = event.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+                parent_tid = payload["id"]
+
+        command_item = _extract_command_item(event)
+        if command_item is not None:
+            commands.append(command_item)
+
         collab = _extract_collab_item(event)
         if collab is not None:
             collab_calls.append(collab)
-        if event.get("type") == "turn.completed" and isinstance(
-            event.get("usage"), dict
-        ):
+
+        if ev_type == "turn.completed" and isinstance(event.get("usage"), dict):
+            turn_completed_seen = True
             usage = event["usage"]
             input_tokens += int(usage.get("input_tokens", 0) or 0)
             cached_input_tokens += int(usage.get("cached_input_tokens", 0) or 0)
@@ -302,6 +451,16 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
             reasoning_output_tokens += int(
                 usage.get("reasoning_output_tokens", 0) or 0
             )
+        elif ev_type == "event_msg":
+            payload = event.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "token_count":
+                info = payload.get("info")
+                if isinstance(info, dict) and isinstance(
+                    info.get("total_token_usage"), dict
+                ):
+                    latest_total_usage = info["total_token_usage"]
+                elif isinstance(payload.get("total_token_usage"), dict):
+                    latest_total_usage = payload["total_token_usage"]
 
     command_texts = [str(command.get("command", "")) for command in commands]
     repeated = sum(count - 1 for count in Counter(command_texts).values() if count > 1)
@@ -318,13 +477,25 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
         )
 
     collab_summary = _summarize_collab_calls(collab_calls, default_parent_tid=parent_tid)
-    token_usage = _finalize_token_usage(
-        input_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        output_tokens,
-        reasoning_output_tokens,
-    )
+    if turn_completed_seen:
+        token_usage = _finalize_token_usage(
+            input_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+        )
+    elif latest_total_usage is not None:
+        token_usage = _finalize_token_usage(
+            int(latest_total_usage.get("input_tokens", 0) or 0),
+            int(latest_total_usage.get("cached_input_tokens", 0) or 0),
+            int(latest_total_usage.get("cache_write_input_tokens", 0) or 0),
+            int(latest_total_usage.get("output_tokens", 0) or 0),
+            int(latest_total_usage.get("reasoning_output_tokens", 0) or 0),
+        )
+    else:
+        token_usage = _empty_token_usage()
+
     return {
         "event_count": len(events),
         "parse_errors": parse_errors,
@@ -355,6 +526,8 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
             "agent_role": None,
             "model": None,
             "reasoning_effort": None,
+            "final_status": None,
+            "final_message": None,
             "event_count": 0,
             "parse_errors": 0,
             "command_count": 0,
@@ -371,6 +544,8 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
     agent_role: str | None = None
     model: str | None = None
     effort: str | None = None
+    final_status: str | None = None
+    final_message: str | None = None
     event_count = 0
     parse_errors = 0
     command_count = 0
@@ -435,27 +610,18 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
                 if isinstance(payload.get("effort"), str):
                     effort = payload["effort"]
 
-        item = event.get("item")
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "command_execution"
-            and ev_type != "item.started"
-        ):
+        command_item = _extract_command_item(event)
+        if command_item is not None:
             command_count += 1
-            if item.get("status") == "completed" and item.get("exit_code") not in (
-                None,
-                0,
-            ):
+            if command_item.get("status") == "completed" and command_item.get(
+                "exit_code"
+            ) not in (None, 0):
                 failed_command_count += 1
-        elif ev_type == "event_msg":
+
+        if ev_type == "event_msg":
             payload = event.get("payload")
             if isinstance(payload, dict):
-                p_type = payload.get("type")
-                if p_type == "exec_command_end":
-                    command_count += 1
-                    if payload.get("exit_code") not in (None, 0):
-                        failed_command_count += 1
-                elif p_type == "token_count":
+                if payload.get("type") == "token_count":
                     info = payload.get("info")
                     if isinstance(info, dict) and isinstance(
                         info.get("total_token_usage"), dict
@@ -463,6 +629,13 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
                         latest_total_usage = info["total_token_usage"]
                     elif isinstance(payload.get("total_token_usage"), dict):
                         latest_total_usage = payload["total_token_usage"]
+                elif payload.get("type") == "task_complete":
+                    final_status = "completed"
+                    if (
+                        isinstance(payload.get("last_agent_message"), str)
+                        and payload["last_agent_message"]
+                    ):
+                        final_message = payload["last_agent_message"]
 
         if ev_type == "turn.completed" and isinstance(event.get("usage"), dict):
             turn_completed_seen = True
@@ -501,6 +674,8 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
         "agent_role": agent_role,
         "model": model,
         "reasoning_effort": effort,
+        "final_status": final_status,
+        "final_message": final_message,
         "event_count": event_count,
         "parse_errors": parse_errors,
         "command_count": command_count,
@@ -521,7 +696,8 @@ def capture_subagent_rollouts(
 ) -> dict[str, Any]:
     """Discover spawned subagent threads in `parent_trace` (and recursively in
     captured child rollouts), copy their persisted rollouts read-only from
-    `sessions_root` into `subagents_dir`, and return aggregated subagent metrics.
+    `sessions_root` into `subagents_dir` (stripping `encrypted_content`), and
+    return aggregated subagent metrics.
 
     Strictly READ-ONLY on `sessions_root`. If no subagents were spawned, does not
     create `subagents_dir`. Missing rollout files degrade gracefully with
@@ -575,7 +751,7 @@ def capture_subagent_rollouts(
         source_rollout = find_rollout(tid, sessions_root)
         if source_rollout is not None and source_rollout.is_file():
             dest_rollout = subagents_dir / f"{tid}.jsonl"
-            shutil.copyfile(source_rollout, dest_rollout)
+            sanitize_trace_jsonl(source_rollout, dest_rollout)
             info = read_rollout_metrics(dest_rollout)
             resolved_parent = info["parent_thread_id"] or inferred_parent
             resolved_depth = (
@@ -605,8 +781,8 @@ def capture_subagent_rollouts(
                 "reasoning_effort": info["reasoning_effort"],
                 "prompt": stub.get("prompt"),
                 "waited": bool(stub.get("waited", False)),
-                "final_status": stub.get("final_status"),
-                "final_message": stub.get("final_message"),
+                "final_status": stub.get("final_status") or info.get("final_status"),
+                "final_message": stub.get("final_message") or info.get("final_message"),
                 "rollout_captured": True,
                 "rollout_file": f"subagents/{tid}.jsonl",
                 "command_count": info["command_count"],

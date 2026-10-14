@@ -161,9 +161,11 @@ API-equivalent cost column:
 
 With `--compare`, an extra **delta** row per test case shows with-skill minus
 baseline for each column (including 4-decimal USD and percent deltas on
-`Est. cost`); a negative delta means the with-skill run used fewer tokens. Read
-tokens together with the score: a skill is only more efficient if it achieves an
-equal-or-better score for fewer output and reasoning tokens.
+`Est. cost`); a negative delta means the with-skill run used fewer tokens. When
+a worker spawns subagents, the reported token counts and cost automatically roll
+up the parent session and all captured subagent rollouts. Read tokens together
+with the score: a skill is only more efficient if it achieves an equal-or-better
+score for fewer output and reasoning tokens.
 
 Token counts are only comparable across runs on the **same model and reasoning
 effort** — different models or reasoning levels produce different counts for the

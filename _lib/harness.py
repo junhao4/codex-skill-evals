@@ -62,6 +62,7 @@ from _lib.grading import (  # noqa: E402, F401
     verdict_implies_pass,
 )
 from _lib.trace import (  # noqa: E402, F401
+    capture_main_rollout,
     capture_subagent_rollouts,
     classify_invocation,
     find_rollout,
@@ -69,6 +70,7 @@ from _lib.trace import (  # noqa: E402, F401
     read_rollout_metrics,
     read_skill_snapshot_text,
     read_turn_context,
+    sanitize_trace_jsonl,
     trace_metrics,
     trace_thread_id,
 )
@@ -379,15 +381,17 @@ def run_trial(
             break
 
     worker_seconds = round(time.monotonic() - worker_started, 3)
-    concatenate_files(trace_parts, worker_dir / "trace.jsonl")
+    capture_main_rollout(
+        trace_parts,
+        worker_dir / "trace.jsonl",
+        thread_id,
+        Path.home() / ".codex" / "sessions",
+    )
     metadata["worker_turns_completed"] = completed_turns
     metadata["thread_id"] = thread_id
-    # Read-only provenance: locate this trial's rollout by thread id and read the
-    # model + reasoning effort that ACTUALLY ran. Never writes/deletes sessions.
-    provenance = read_turn_context(
-        find_rollout(thread_id, Path.home() / ".codex" / "sessions")
-        or Path("/nonexistent")
-    )
+    # Read-only provenance: read the model + reasoning effort that ACTUALLY ran
+    # from the captured rollout trace. Never writes/deletes ~/.codex/sessions/.
+    provenance = read_turn_context(worker_dir / "trace.jsonl")
     metadata["resolved_model"] = provenance["model"]
     metadata["resolved_reasoning_effort"] = provenance["reasoning_effort"]
     write_json(run_dir / "run.json", metadata)

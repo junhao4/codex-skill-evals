@@ -257,31 +257,35 @@ brittle deterministic string match.
 ### Evaluating orchestrator skills that spawn subagents
 
 Some skills *delegate* subtasks to spawned child agents instead of doing all the
-work themselves. The parent worker's `trace.jsonl` records each spawn and wait as
-a structured event, so a deterministic `check.py` can prove delegation actually
-happened — without needing the child agents' own transcripts.
+work themselves. The harness captures the main worker's persisted rollout into
+`worker/trace.jsonl` and spawned child rollouts into
+`worker/subagents/<thread-id>.jsonl` read-only from `~/.codex/sessions/`
+(stripping only opaque `encrypted_content` ciphertext and recursing when a child
+spawns its own subagents), normalises collaboration events, and rolls up parent
++ subagent token usage in `worker/metrics.json` and `result.json`.
 
 The key failure mode to catch is an orchestrator that *claims* to delegate but
-did the work itself (or rubber-stamped a result). Grade it behaviourally from the
-parent trace:
+did the work itself (or rubber-stamped a result). Grade delegation behaviourally:
 
-| Check | Evidence in `trace.jsonl` |
-|---|---|
-| At least N subagents actually ran | Count events with `tool == "spawn_agent"` |
-| Distinct children (not one spawned N times) | De-duplicate `receiver_thread_ids` |
-| The orchestrator waited for results | A matching `tool == "wait"` event |
-| Each subagent's work is correct | Grade the consolidated *artifact* the orchestrator produced, not the child transcripts |
+| Check | Evidence in `worker/metrics.json` / `worker/subagents/manifest.json` | Raw evidence in `worker/trace.jsonl` |
+|---|---|---|
+| At least N subagents actually ran | `subagent_spawn_count >= N` | Events with `tool == "spawn_agent"` |
+| Distinct children (not one spawned N times) | `len(subagent_thread_ids) >= N` | De-duplicated `receiver_thread_ids` |
+| The orchestrator waited for results | `subagent_wait_count >= 1` (or `subagents[i]["waited"] == True`) | Matching `tool` in `{"wait", "wait_agent"}` |
+| Child lineage, model, and token breakdown | `subagents[i]` (`depth`, `parent_thread_id`, `model`, `token_usage`) | `worker/subagents/<thread-id>.jsonl` |
+| Each subagent's work is correct | Grade the consolidated *artifact* the orchestrator produced (and use `worker/subagents/` when checking handoff fidelity) | — |
 
-Match on `tool == "spawn_agent"` plus the presence of `receiver_thread_ids`, and
-tolerate both event casings: the live stream emits `collab_tool_call`, while the
-persisted rollout emits `CollabAgentToolCall`.
+If a `check.py` script inspects `worker/trace.jsonl` directly rather than
+reading `worker/metrics.json`, tolerate both Codex event casings: the live
+`--json` stream emits `collab_tool_call`, while persisted rollouts emit
+`CollabAgentToolCall`.
 
-Grade subagent *outcomes* through the workspace artifact the orchestrator writes,
-not by reaching into child rollouts. Child transcripts live outside the trial's
-run directory (in Codex's global session store) and are an internal,
-version-specific format; depending on them makes a check fragile. Asserting
-"delegation happened" (from the parent trace) plus "the result is correct" (from
-the artifact) is both sufficient and durable.
+Grade subagent *outcomes* primarily through the workspace artifact the
+orchestrator writes, paired with `worker/metrics.json` (or
+`worker/subagents/manifest.json`) to prove delegation and wait handoffs actually
+occurred. Semantic judges are also pointed at `worker/metrics.json` and
+`worker/subagents/` when present so they can verify specialist prompts and
+handoff evidence without depending on fragile internal rollout formatting.
 
 ### `supporting-skills/`: optional skill dependencies
 
@@ -319,11 +323,11 @@ user message. There is deliberately no `expect` field: the harness sends the
 scripted turns unconditionally, then `check.py` and the semantic judges assess
 whether the worker behaved correctly at each stage.
 
-For a single-turn case, the worker runs ephemerally. For a multi-turn case, the
-first `codex exec` creates a persisted session and each interaction uses
-`codex exec resume` with the thread ID from turn 1. This is why each interaction
-adds one worker model call. The installed Codex CLI must support `codex exec
-resume`.
+Turn 1 always creates a persisted session so provenance and the full rollout can
+be read back from `~/.codex/sessions/`; each interaction in a multi-turn case
+then uses `codex exec resume` with the thread ID from turn 1. This is why each
+interaction adds one worker model call. The installed Codex CLI must support
+`codex exec resume`.
 
 Structurally validate the evaluation definition before spending model calls:
 

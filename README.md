@@ -125,8 +125,8 @@ The authoring, running, and output reference material lives under `docs/` to
 keep this README focused on getting started:
 
 - [Authoring test cases](docs/authoring.md) — fixtures, prompts, graders
-  (`check.py` and `expected.md`), supporting skills, and multi-turn
-  interactions.
+  (`check.py` and `expected.md`), subagent/orchestrator skills, supporting
+  skills, and multi-turn interactions.
 - [Running evaluations](docs/running.md) — the `list`, `check`, `run`, and
   `compare` commands, run flags, cost, and how the semantic jury decides
   pass/fail.
