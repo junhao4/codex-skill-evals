@@ -216,3 +216,123 @@ def test_render_markdown_includes_skill_diff_fence():
     assert "-old line" in md
     assert "+new line" in md
 
+
+def test_render_markdown_includes_case_overview_and_det_sem_scores():
+    old_c = _cell(85, 2, 2, output=5000)
+    old_c["mean_deterministic_score"] = 100
+    old_c["mean_semantic_score"] = 85
+    new_c = _cell(100, 2, 2, output=4000)
+    new_c["mean_deterministic_score"] = 100
+    new_c["mean_semantic_score"] = 100
+
+    partition = {"both": ["case-a"], "only_old": [], "only_new": []}
+    rows = [
+        {
+            "test_case": "case-a",
+            "diff": evalmod.compare_cell(old_c, new_c),
+            "confounds": [],
+        }
+    ]
+    summary = {"improved": 1, "regressed": 0, "unchanged": 0}
+    provenance = {
+        "old_model": "gpt-5.6-luna", "new_model": "gpt-5.6-luna",
+        "old_effort": "xhigh", "new_effort": "xhigh",
+        "trials": {"old": 2, "new": 2},
+    }
+    md = evalmod.render_comparison_markdown(
+        "myskill", "e1", "e2", partition, rows, [], summary, provenance
+    )
+    assert "## Case overview" in md
+    assert "| case-a | 85 -> 100 (+15) | 2/2 -> 2/2 |" in md
+    assert "| det score | 100 | 100 |" in md
+    assert "| sem score | 85 | 100 |" in md
+
+
+def test_cell_backfills_det_and_sem_scores_from_results():
+    exp = {
+        "aggregates": {
+            "cells": {
+                "case-a": {
+                    "with-skill": {
+                        "mean_score": 90,
+                        "passed_trials": 2,
+                        "total_trials": 2,
+                        "mean_tokens": {},
+                    }
+                }
+            }
+        },
+        "results": [
+            {
+                "test_case": "case-a",
+                "configuration": "with-skill",
+                "deterministic_score": 100,
+                "semantic_score": 85,
+            },
+            {
+                "test_case": "case-a",
+                "configuration": "with-skill",
+                "deterministic_score": 100,
+                "semantic_score": 95,
+            },
+        ],
+    }
+    c = evalmod._cell(exp, "case-a", "with-skill")
+    assert c["mean_deterministic_score"] == 100
+    assert c["mean_semantic_score"] == 90
+
+
+def test_compare_experiments_supports_baseline_config(tmp_path):
+    import argparse
+    import json
+
+    skill_dir = tmp_path / "demo"
+    for exp_id, score in (("experiment-001", 80), ("experiment-002", 95)):
+        exp_dir = skill_dir / "runs" / exp_id
+        exp_dir.mkdir(parents=True)
+        manifest = {
+            "skill": "demo",
+            "trials": 1,
+            "test_cases": ["case-a"],
+            "aggregates": {
+                "cells": {
+                    "case-a": {
+                        "baseline": {
+                            "mean_score": score,
+                            "passed_trials": 1,
+                            "total_trials": 1,
+                            "mean_tokens": {
+                                "uncached_input_tokens": 1000,
+                                "output_tokens": 500,
+                                "reasoning_output_tokens": 100,
+                                "billed_output_tokens": 600,
+                            },
+                        }
+                    }
+                }
+            },
+            "results": [
+                {
+                    "test_case": "case-a",
+                    "configuration": "baseline",
+                    "resolved_model": "gpt-5.6-luna",
+                    "resolved_reasoning_effort": "low",
+                    "deterministic_score": 100,
+                    "semantic_score": score,
+                }
+            ],
+        }
+        (exp_dir / "experiment.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    args = argparse.Namespace(
+        skill="demo", old="experiment-001", new="experiment-002", config="baseline"
+    )
+    rc = evalmod.compare_experiments(args, {"demo": skill_dir})
+    assert rc == 0
+    out_file = skill_dir / "comparisons" / "experiment-001-vs-experiment-002-baseline.md"
+    assert out_file.exists()
+    content = out_file.read_text(encoding="utf-8")
+    assert "# Comparison: demo (baseline) — experiment-001 (v1) vs experiment-002 (v2)" in content
+    assert "| Configuration | baseline | baseline |" in content
+
+

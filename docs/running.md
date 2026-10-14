@@ -6,7 +6,7 @@ How to run skill evaluations and interpret the pass/fail decision. See [authorin
 
 Run commands from the repository root.
 
-### The three commands
+### The four commands
 
 | Goal | Command | Calls a model? |
 |---|---|---:|
@@ -15,6 +15,7 @@ Run commands from the repository root.
 | Structurally validate one evaluation | `python3 .agents/evals/eval.py check <skill-name>` | No |
 | Run every test case | `python3 .agents/evals/eval.py run <skill-name>` | Yes |
 | Run one test case | `python3 .agents/evals/eval.py run <skill-name> <test-case-name>` | Yes |
+| Compare two existing experiments | `python3 .agents/evals/eval.py compare <skill-name> <old-exp> <new-exp>` | No |
 
 The simplest real run is:
 
@@ -49,7 +50,7 @@ so peak concurrency is `8 × judges`.
 `--no-semantic-judges` rejects a selected test case that has no `check.py`.
 This happens before an experiment is created or any model is called. The flag
 does not make the entire evaluation model-free: the worker agent must still run
-the task. Only `list` and `check` make no model calls.
+the task. Only `list`, `check`, and `compare` make no model calls.
 
 `N` does not need to be odd; any positive number is accepted. Three is the
 default because it permits a majority decision without the cost of a larger
@@ -90,28 +91,29 @@ run the task again and cannot see one another's grades.
 
 | Jury output | Rule |
 |---|---|
-| Pass/fail | Strict majority of the requested judge count: `floor(N / 2) + 1` pass votes |
-| Score out of 100 | Rounded median of all valid judge scores |
-| Judge failure | Tolerated only while enough valid judges remain to reach the original quorum |
-| Explanations | Every individual grade is preserved; the consensus records votes and scores |
-
-For an even jury, ties fail because there is no strict pass majority. This is
-why odd counts are normally easier to interpret, although the harness permits
-even counts for experiments.
+| Score out of 100 | Rounded median of all deciding judge scores (`round(median(scores))`) |
+| Pass/fail & band | Derived from the consensus score: `score >= 70` passes (`full_pass` `100`, `pass` `70..99`, `partial` `1..69`, `fail` `0`) |
+| Abstention (`insufficient_evidence`) | Excluded from the score median; if deciding judges fall below quorum (`floor(N / 2) + 1`), the trial becomes `needs_review` |
+| Judge failure | Tolerated only while enough valid judges remain to reach the original quorum (`floor(N / 2) + 1`) |
+| Explanations | Every individual grade is preserved; the consensus records deciding scores and abstentions |
 
 The final trial passes only when all of these are true:
 
 1. the worker exits successfully;
 2. protected inputs remain intact;
 3. every configured grading system returns a valid grade;
-4. the deterministic grader passes, when configured;
-5. the semantic jury passes, when configured.
+4. the deterministic grader passes (`score >= 70`), when configured;
+5. the semantic jury passes (`score >= 70`), when configured.
 
-Deterministic and semantic scores remain separate because they measure
-different kinds of evidence. The headline score uses the semantic consensus
-when available; otherwise it uses the deterministic score.
+Deterministic and semantic scores are recorded separately (`deterministic_score`
+and `semantic_score`) because they measure different kinds of evidence. When
+both graders run, the trial's headline `score` is `min(deterministic_score,
+semantic_score)` so a failing grader is never masked by a passing one. Both
+grader sub-scores are shown alongside `Score` in the `## Trials` table, and any
+point deductions (`score < 100`) are surfaced in `## Findings` even on passing
+trials.
 
-### What `--compare` does
+### What `--compare` does (within one experiment)
 
 | Configuration | Target skill available? | Worker prompt |
 |---|---:|---|
@@ -122,12 +124,31 @@ Use an implicit prompt for a normal baseline comparison. If the prompt
 explicitly requests `$<skill-name>`, the baseline instead tests what happens
 when a requested skill is unavailable.
 
-### Token usage
+### Comparing two experiments (`eval.py compare`)
 
-Every run that produces results includes a token usage section in the report,
-alongside the score — it is a measurement, not a comparison-only feature. It
-shows the mean tokens per trial for each configuration, broken into four
-categories:
+To compare two saved experiments (for example before and after editing
+`SKILL.md`) without making any new model calls:
+
+```bash
+# Compare with-skill cells (default) -> writes comparisons/<old>-vs-<new>.md
+python3 .agents/evals/eval.py compare <skill-name> experiment-001 experiment-002
+
+# Compare baseline cells -> writes comparisons/<old>-vs-<new>-baseline.md
+python3 .agents/evals/eval.py compare <skill-name> experiment-001 experiment-002 --config baseline
+```
+
+The generated Markdown report under `.agents/evals/<skill-name>/comparisons/`
+includes a `Setup` and `Summary` header, a one-row-per-case `## Case overview`
+table, per-case score/token/cost breakdowns (including `det score` and
+`sem score` when available), confound detection when the model or fixture
+changed, and a unified diff of the captured `SKILL.md` snapshots.
+
+### Token usage and API-equivalent cost
+
+Every run that produces results includes a `## Token usage` section in
+`report.md`, showing the mean tokens per trial for each configuration, a
+`**Total**` row summing across all trials in the experiment, and an estimated
+API-equivalent cost column:
 
 | Column | Meaning |
 |---|---|
@@ -136,17 +157,18 @@ categories:
 | Output | Visible output tokens |
 | Reasoning | Reasoning tokens — these bill as output |
 | Billed output | `output + reasoning`, the figure that drives output cost |
+| Est. cost | Estimated API-equivalent USD at public API list prices (not actual subscription or credit spend) |
 
 With `--compare`, an extra **delta** row per test case shows with-skill minus
-baseline for each column; a negative delta means the with-skill run used fewer
-tokens. Read tokens together with the score: a skill is only more efficient if
-it achieves an equal-or-better score for fewer output and reasoning tokens.
+baseline for each column (including 4-decimal USD and percent deltas on
+`Est. cost`); a negative delta means the with-skill run used fewer tokens. Read
+tokens together with the score: a skill is only more efficient if it achieves an
+equal-or-better score for fewer output and reasoning tokens.
 
 Token counts are only comparable across runs on the **same model and reasoning
 effort** — different models or reasoning levels produce different counts for the
-same task. The report's Result section records the model and reasoning effort
-that actually produced the run (read back from the Codex rollout), so you can
-confirm two runs are comparable. The harness uses whatever model and reasoning
-effort your Codex configuration provides; hold both constant when comparing
-runs, and check the recorded values match.
+same task. The report's `**Setup:**` header line records the model and reasoning
+effort that actually produced the run (read back from the Codex rollout), so you
+can confirm two runs are comparable.
+
 

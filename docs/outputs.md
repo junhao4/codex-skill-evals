@@ -5,17 +5,21 @@ Reference for the files written under `runs/` by each experiment and trial. See 
 ### Where the outputs go
 
 ```text
-.agents/evals/<skill-name>/runs/experiment-NNN/
-├── report.md
-├── experiment.json
-└── trials/
-    └── <test-case-name>/
-        └── <configuration>/
-            └── trial-NN/
+.agents/evals/<skill-name>/
+├── comparisons/
+│   └── <old-exp>-vs-<new-exp>.md
+└── runs/
+    └── experiment-NNN/
+        ├── report.md
+        ├── experiment.json
+        └── trials/
+            └── <test-case-name>/
+                └── <configuration>/
+                    └── trial-NN/
 ```
 
-Start with `report.md`. It is the only file intended for ordinary reading.
-The harness writes it directly from the collected results; creating it does not
+Start with `report.md` (or `comparisons/<old-exp>-vs-<new-exp>.md` after running `eval.py compare`). They are the files intended for ordinary reading.
+The harness writes them directly from the collected results; creating them does not
 make another model call.
 
 At the end of a normal run, the terminal points directly to it:
@@ -29,8 +33,9 @@ Report: .../.agents/evals/<skill-name>/runs/experiment-NNN/report.md
 
 | Output | When written | Meaning |
 |---|---|---|
-| `report.md` | Updated when the experiment completes, fails, or is interrupted | Human-readable outcome, mean score, run provenance (model, reasoning effort, trials, date), trial table, baseline comparison, token usage, and main failure reasons |
+| `report.md` | Updated when the experiment completes, fails, or is interrupted | One-line `Setup` provenance header (model, reasoning effort, trials, judges, status, start time), horizontal `Result` summary table (outcome, mean score, passed, needs review, completed, est. total cost), `Trials` table (`Score`, `Det`, `Sem`, `Band`, `Pass`, `Evidence`), `Findings` (failures and passing score deductions), `Baseline comparison`, and `Token usage` (mean per cell + total row) |
 | `experiment.json` | Created before the first trial and finalized when the experiment stops | Complete machine-readable manifest, status, aggregate results, and all trial summaries |
+| `comparisons/<old>-vs-<new>.md` | Written by `eval.py compare <skill> <old> <new>` | Cross-experiment diff (`Setup`, `Summary`, `Case overview`, per-case score/token/cost breakdown, and `SKILL.md` snapshot diff) |
 
 Open `experiment.json` only when a script needs the data or when you need more
 detail than the report provides. Follow the links in `report.md` into

@@ -203,3 +203,46 @@ def test_report_cost_na_when_multiple_models_in_one_run(tmp_path):
     text = report_path.read_text(encoding="utf-8")
     # no priced dollar figure in the token table; cost cells are n/a
     assert "n/a (model not in price table)" in text
+
+
+def test_format_cost_delta_sub_cent_precision():
+    assert eval_mod.format_cost_delta(0.0061, 0.0052) == "-$0.0009 (-14.8%)"
+    assert eval_mod.format_cost_delta(0.0050, 0.0060) == "+$0.0010 (+20.0%)"
+    assert eval_mod.format_cost_delta(0.0050, 0.0050) == "+$0.0000 (+0.0%)"
+    assert eval_mod.format_cost_delta(None, 0.0050) == "n/a"
+
+
+def test_report_renders_det_sem_and_passing_deductions(tmp_path):
+    r1 = _result_model("case-a", "baseline", 1000, "gpt-5.6-luna")
+    r1["score"] = 95
+    r1["deterministic_score"] = 100
+    r1["semantic_score"] = 95
+    r1["score_band"] = "pass"
+    r1["semantic"] = {"reasons": ["Minor style nit (-5 pts)"]}
+
+    r2 = _result_model("case-a", "with-skill", 800, "gpt-5.6-luna")
+    r2["score"] = 100
+    r2["deterministic_score"] = 100
+    r2["semantic_score"] = 100
+    r2["score_band"] = "full_pass"
+
+    results = [r1, r2]
+    aggregates = eval_mod.aggregate(results)
+    experiment = {
+        "skill": "demo", "status": "completed", "overall_pass": True,
+        "mean_score": 97.5, "passed_trials": 2, "worker_trials": 2,
+        "semantic_judges": 1, "trials": 1, "started_at": "2026-10-09T00:00:00Z",
+    }
+    report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
+    text = report_path.read_text(encoding="utf-8")
+
+    # Trials table includes Det and Sem columns
+    assert "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Evidence |" in text
+    assert "| case-a | baseline | 1 | 95 | 100 | 95 | pass | Yes |" in text
+    # Findings section surfaces the 5-pt deduction even though the trial passed
+    assert "## Findings" in text
+    assert "**case-a / baseline / trial-01** (`PASS, score 95`)" in text
+    assert "Minor style nit (-5 pts)" in text
+    # Total row in Token usage
+    assert "| **Total (2 trials)** |" in text
+

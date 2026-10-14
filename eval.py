@@ -221,6 +221,12 @@ def parse_args() -> argparse.Namespace:
     compare_parser.add_argument("skill", help="skill directory name")
     compare_parser.add_argument("old", help="older experiment id, e.g. experiment-001")
     compare_parser.add_argument("new", help="newer experiment id, e.g. experiment-002")
+    compare_parser.add_argument(
+        "--config",
+        choices=("with-skill", "baseline"),
+        default="with-skill",
+        help="configuration cell to compare across experiments (default: with-skill)",
+    )
     return parser.parse_args()
 
 
@@ -304,6 +310,8 @@ def aggregate(results: list[dict]) -> dict:
             result["configuration"],
             {
                 "scores": [],
+                "det_scores": [],
+                "sem_scores": [],
                 "token_samples": [],
                 "passed_trials": 0,
                 "needs_review_trials": 0,
@@ -317,8 +325,16 @@ def aggregate(results: list[dict]) -> dict:
             cell["needs_review_trials"] += 1
             continue
         cell["passed_trials"] += int(result["overall_pass"])
-        if isinstance(result["score"], (int, float)):
+        if isinstance(result.get("score"), (int, float)) and not isinstance(
+            result.get("score"), bool
+        ):
             cell["scores"].append(result["score"])
+        det_s = result.get("deterministic_score")
+        if isinstance(det_s, (int, float)) and not isinstance(det_s, bool):
+            cell["det_scores"].append(det_s)
+        sem_s = result.get("semantic_score")
+        if isinstance(sem_s, (int, float)) and not isinstance(sem_s, bool):
+            cell["sem_scores"].append(sem_s)
         tokens = result.get("tokens")
         if isinstance(tokens, dict):
             cell["token_samples"].append(tokens)
@@ -327,7 +343,15 @@ def aggregate(results: list[dict]) -> dict:
     for test_case_name, configurations in cells.items():
         for cell in configurations.values():
             scores = cell.pop("scores")
+            det_scores = cell.pop("det_scores")
+            sem_scores = cell.pop("sem_scores")
             cell["mean_score"] = round(sum(scores) / len(scores), 2) if scores else None
+            cell["mean_deterministic_score"] = (
+                round(sum(det_scores) / len(det_scores), 2) if det_scores else None
+            )
+            cell["mean_semantic_score"] = (
+                round(sum(sem_scores) / len(sem_scores), 2) if sem_scores else None
+            )
             samples = cell.pop("token_samples")
             mean_tokens: dict[str, float] = {}
             for field in TOKEN_FIELDS:
@@ -382,6 +406,19 @@ def format_delta(old, new) -> str:
     return f"{abs_text} ({percent:+.1f}%)"
 
 
+def format_cost_delta(old_cost: float | None, new_cost: float | None) -> str:
+    """Render a signed 4-decimal USD + percent change, e.g. '-$0.0009 (-14.2%)'. Pure."""
+    if old_cost is None or new_cost is None:
+        return "n/a"
+    diff = new_cost - old_cost
+    sign = "+" if diff >= 0 else "-"
+    abs_text = f"{sign}${abs(diff):.4f}"
+    if old_cost == 0:
+        return abs_text if diff == 0 else f"{abs_text} (n/a%)"
+    percent = diff / old_cost * 100
+    return f"{abs_text} ({percent:+.1f}%)"
+
+
 def write_report(
     experiment_root: Path,
     experiment: dict,
@@ -410,37 +447,54 @@ def write_report(
     reasoning_text = _distinct("resolved_reasoning_effort")
     trials_text = str(experiment.get("trials", len(results)))
     date_text = experiment.get("started_at", "unknown")
+    exp_id = experiment.get("id")
+    title = (
+        f"# Evaluation report: {experiment['skill']} (`{exp_id}`)"
+        if exp_id
+        else f"# Evaluation report: {experiment['skill']}"
+    )
+
+    # Only price when exactly one priced model produced the run; otherwise the
+    # dollar figure would mix rate cards. _distinct joins multiple models.
+    cost_model = model_text if model_text in PRICING else None
+    total_cost: float | None = None
+    if cost_model and results:
+        trial_costs = [
+            estimate_api_cost(r.get("tokens") or {}, cost_model)
+            for r in results
+            if isinstance(r.get("tokens"), dict)
+        ]
+        if trial_costs and all(c is not None for c in trial_costs):
+            total_cost = round(sum(c for c in trial_costs if c is not None), 6)
 
     lines = [
-        f"# Evaluation report: {experiment['skill']}",
+        title,
+        "",
+        f"**Setup:** Model `{markdown_cell(model_text)}` · "
+        f"Reasoning effort `{markdown_cell(reasoning_text)}` · "
+        f"Trials per cell `{markdown_cell(trials_text)}` · "
+        f"Semantic judges `{experiment.get('semantic_judges', 0)}` · "
+        f"Status `{experiment['status']}` · "
+        f"Started `{markdown_cell(date_text)}`",
         "",
         "## Result",
         "",
-        "| Field | Value |",
-        "|---|---|",
-        f"| Outcome | **{outcome}** |",
-        f"| Mean score | {score_text} |",
-        f"| Passed trials | {experiment.get('passed_trials', 0)}/{len(results)} |",
-        f"| Needs review | {experiment.get('needs_review_trials', 0)}/{len(results)} |",
-        f"| Completed trials | {len(results)}/{experiment['worker_trials']} |",
-        f"| Experiment status | {experiment['status']} |",
-        f"| Semantic judges | {experiment.get('semantic_judges', 0)} per eligible trial |",
-        f"| Model | {markdown_cell(model_text)} |",
-        f"| Reasoning effort | {markdown_cell(reasoning_text)} |",
-        f"| Trials per cell | {markdown_cell(trials_text)} |",
-        f"| Started | {markdown_cell(date_text)} |",
+        "| Outcome | Mean score | Passed | Needs review | Completed | Est. total cost |",
+        "|:---:|---:|---:|---:|---:|---:|",
+        f"| **{outcome}** | {score_text} | "
+        f"{experiment.get('passed_trials', 0)}/{len(results)} | "
+        f"{experiment.get('needs_review_trials', 0)}/{len(results)} | "
+        f"{len(results)}/{experiment['worker_trials']} | "
+        f"{format_cost(total_cost)} |",
         "",
-        "Token counts below are only comparable across runs on the same model "
-        "and reasoning effort.",
-        "",
-        "## Trial results",
+        "## Trials",
         "",
     ]
     if results:
         lines.extend(
             [
-                "| Test case | Configuration | Trial | Score | Band | Pass | Details |",
-                "|---|---|---:|:--:|---:|---:|---|",
+                "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Evidence |",
+                "|---|---|---:|---:|---:|---:|:--:|:--:|---|",
             ]
         )
         for result in results:
@@ -452,6 +506,18 @@ def write_report(
             result_score = result.get("score")
             shown_score = (
                 result_score if isinstance(result_score, (int, float)) else "—"
+            )
+            det_score = result.get("deterministic_score")
+            shown_det = (
+                det_score
+                if isinstance(det_score, (int, float)) and not isinstance(det_score, bool)
+                else "—"
+            )
+            sem_score = result.get("semantic_score")
+            shown_sem = (
+                sem_score
+                if isinstance(sem_score, (int, float)) and not isinstance(sem_score, bool)
+                else "—"
             )
             is_review = (
                 result.get("needs_review") or result.get("status") == "needs_review"
@@ -471,6 +537,8 @@ def write_report(
                         markdown_cell(result["configuration"]),
                         str(result["trial"]),
                         str(shown_score),
+                        str(shown_det),
+                        str(shown_sem),
                         band,
                         (
                             "Review"
@@ -484,6 +552,84 @@ def write_report(
             )
     else:
         lines.append("No trial completed successfully enough to produce a result.")
+
+    # Findings: surface both failing trials and score deductions on passing trials
+    # so any <100 score is explained directly in report.md.
+    def _trial_reasons(r: dict) -> list[str]:
+        if r.get("failure_reasons"):
+            return list(r["failure_reasons"])
+        combined: list[str] = []
+        for section in ("deterministic", "semantic"):
+            sec = r.get(section)
+            if isinstance(sec, dict):
+                for item in sec.get("reasons") or []:
+                    if item and item not in combined:
+                        combined.append(str(item))
+        r_score = r.get("score")
+        run_dir = r.get("run_directory")
+        if (
+            not combined
+            and isinstance(r_score, (int, float))
+            and r_score < 100
+            and run_dir
+        ):
+            sem_file = Path(run_dir) / "grades" / "semantic" / "result.json"
+            sem_data = read_json(sem_file) if sem_file.is_file() else None
+            if isinstance(sem_data, dict):
+                for j in sem_data.get("judges") or []:
+                    jr = j.get("result") if isinstance(j, dict) else None
+                    if not isinstance(jr, dict) or (jr.get("score") or 100) >= 100:
+                        continue
+                    for chk in jr.get("checks") or []:
+                        if not isinstance(chk, dict):
+                            continue
+                        notes = str(chk.get("notes") or "").strip()
+                        if notes and (
+                            chk.get("pass") is False
+                            or chk.get("verdict") not in (None, "pass")
+                            or "deduct" in notes.lower()
+                        ):
+                            cid = chk.get("id", "check")
+                            entry = f"semantic/{cid}: {notes}"
+                            if entry not in combined:
+                                combined.append(entry)
+        return combined
+
+    notable = [
+        result
+        for result in results
+        if _trial_reasons(result)
+        or (
+            not result["overall_pass"]
+            and not (
+                result.get("needs_review") or result.get("status") == "needs_review"
+            )
+        )
+    ]
+    if notable or experiment.get("error"):
+        lines.extend(["", "## Findings", ""])
+        if experiment.get("error"):
+            lines.append(f"- **Harness:** {experiment['error']}")
+        for result in notable:
+            label = (
+                f"{result['test_case']} / {result['configuration']} / "
+                f"trial-{result['trial']:02d}"
+            )
+            r_score = result.get("score")
+            score_tag = f", score {r_score}" if isinstance(r_score, (int, float)) else ""
+            if result.get("needs_review") or result.get("status") == "needs_review":
+                tag = f"REVIEW{score_tag}"
+            elif result.get("overall_pass"):
+                tag = f"PASS{score_tag}"
+            else:
+                tag = f"FAIL{score_tag}"
+            reasons = _trial_reasons(result) or [
+                "The trial did not satisfy every configured pass condition."
+            ]
+            for reason in reasons:
+                lines.append(
+                    f"- **{markdown_cell(label)}** (`{tag}`): {markdown_cell(reason)}"
+                )
 
     comparisons = aggregates.get("comparisons", {})
     if comparisons:
@@ -515,28 +661,11 @@ def write_report(
                 "",
                 "## Token usage",
                 "",
-                "Mean tokens per trial. `billed output` = output + reasoning "
-                "(reasoning bills as output). `uncached input` = input - cached. "
-                "Where a baseline is compared, a negative delta means with-skill "
-                "used fewer tokens. Token counts are only comparable across runs "
-                "on the same model and reasoning effort.",
-                "",
-                f"The `est. cost` column is an **API-equivalent estimate only** "
-                f"(public API list prices as of {PRICING_AS_OF}, "
-                f"{PRICING_SOURCE}) — it is NOT your actual subscription or "
-                f"credit spend; it is a model-agnostic unit for comparing runs. "
-                f"The short- vs long-context rate is auto-selected per trial at "
-                f"{LONG_CONTEXT_THRESHOLD:,} input tokens. `n/a` means the model "
-                f"is not in the price table.",
-                "",
                 "| Test case | Config | Uncached input | Cached input | "
                 "Output | Reasoning | Billed output | Est. cost |",
                 "|---|---|---:|---:|---:|---:|---:|---:|",
             ]
         )
-        # Only cost when exactly one priced model produced the run; otherwise the
-        # dollar figure would mix rate cards. _distinct joins multiple models.
-        cost_model = model_text if model_text in PRICING else None
         for name in sorted(cells):
             for config in ("baseline", "with-skill"):
                 mt = cells.get(name, {}).get(config, {}).get("mean_tokens")
@@ -545,11 +674,11 @@ def write_report(
                 cost = estimate_api_cost(mt, cost_model)
                 lines.append(
                     f"| {markdown_cell(name)} | {config} | "
-                    f"{mt.get('uncached_input_tokens', 0)} | "
-                    f"{mt.get('cached_input_tokens', 0)} | "
-                    f"{mt.get('output_tokens', 0)} | "
-                    f"{mt.get('reasoning_output_tokens', 0)} | "
-                    f"{mt.get('billed_output_tokens', 0)} | "
+                    f"{_fmt(mt.get('uncached_input_tokens', 0))} | "
+                    f"{_fmt(mt.get('cached_input_tokens', 0))} | "
+                    f"{_fmt(mt.get('output_tokens', 0))} | "
+                    f"{_fmt(mt.get('reasoning_output_tokens', 0))} | "
+                    f"{_fmt(mt.get('billed_output_tokens', 0))} | "
                     f"{format_cost(cost)} |"
                 )
             td = comparisons.get(name, {}).get("token_delta")
@@ -566,50 +695,37 @@ def write_report(
                 cell_text = " | ".join(
                     format_delta(base_mt.get(f, 0), skill_mt.get(f, 0)) for f in fields
                 )
-                cost_delta = format_delta(
+                cost_delta = format_cost_delta(
                     estimate_api_cost(base_mt, cost_model),
                     estimate_api_cost(skill_mt, cost_model),
                 )
                 lines.append(
                     f"| {markdown_cell(name)} | **delta** | {cell_text} | {cost_delta} |"
                 )
-
-    failed = [
-        result
-        for result in results
-        if not result["overall_pass"]
-        and not (
-            result.get("needs_review") or result.get("status") == "needs_review"
-        )
-    ]
-    if failed or experiment.get("error"):
-        lines.extend(["", "## Main failure reasons", ""])
-        if experiment.get("error"):
-            lines.append(f"- Harness: {experiment['error']}")
-        for result in failed:
-            label = (
-                f"{result['test_case']} / {result['configuration']} / "
-                f"trial-{result['trial']:02d}"
+        token_trials = [r.get("tokens") for r in results if isinstance(r.get("tokens"), dict)]
+        if len(token_trials) > 1:
+            sum_uncached = sum(t.get("uncached_input_tokens", 0) or 0 for t in token_trials)
+            sum_cached = sum(t.get("cached_input_tokens", 0) or 0 for t in token_trials)
+            sum_output = sum(t.get("output_tokens", 0) or 0 for t in token_trials)
+            sum_reasoning = sum(t.get("reasoning_output_tokens", 0) or 0 for t in token_trials)
+            sum_billed = sum(t.get("billed_output_tokens", 0) or 0 for t in token_trials)
+            lines.append(
+                f"| **Total ({len(token_trials)} trials)** | — | "
+                f"**{sum_uncached}** | **{sum_cached}** | **{sum_output}** | "
+                f"**{sum_reasoning}** | **{sum_billed}** | **{format_cost(total_cost)}** |"
             )
-            reasons = result.get("failure_reasons") or [
-                "The trial did not satisfy every configured pass condition."
+        lines.extend(
+            [
+                "",
+                f"_Per-case rows are trial means (comparable only on the same model and "
+                f"reasoning effort); `Billed output` = output + reasoning. `Est. cost` is "
+                f"an **API-equivalent estimate only** (public API list prices as of "
+                f"{PRICING_AS_OF}) — NOT your actual subscription or credit spend._",
             ]
-            for reason in reasons:
-                lines.append(f"- **{markdown_cell(label)}:** {markdown_cell(reason)}")
+        )
 
-    lines.extend(
-        [
-            "",
-            "## Detailed evidence",
-            "",
-            "Open `trials/` for each disposable workspace, worker trace, Git evidence, "
-            "and configured grader outputs. `experiment.json` contains the complete "
-            "machine-readable experiment data.",
-            "",
-        ]
-    )
     report = experiment_root / "report.md"
-    report.write_text("\n".join(lines), encoding="utf-8")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 
 
@@ -861,7 +977,7 @@ def _case_representative(experiment: dict, test_case: str, configuration: str) -
 
 
 def compare_cell(old_cell: dict, new_cell: dict) -> dict:
-    """Diff two with-skill cells across score, pass rate, and token axes. Pure.
+    """Diff two cells across score, pass rate, and token axes. Pure.
 
     Verdict direction: score and pass rate are higher-is-better; every token
     axis is lower-is-better (fewer tokens for equal-or-better score is the win).
@@ -881,6 +997,8 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
     result = {
         "n_old": old_cell.get("total_trials", 0),
         "n_new": new_cell.get("total_trials", 0),
+        "passed_old": old_cell.get("passed_trials", 0),
+        "passed_new": new_cell.get("passed_trials", 0),
         "score": {
             "old": old_score,
             "new": new_score,
@@ -892,6 +1010,18 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
             "verdict": _axis_verdict(old_pass, new_pass, higher_is_better=True),
         },
     }
+    for key, cell_field in (
+        ("deterministic_score", "mean_deterministic_score"),
+        ("semantic_score", "mean_semantic_score"),
+    ):
+        old_val = old_cell.get(cell_field)
+        new_val = new_cell.get(cell_field)
+        if old_val is not None or new_val is not None:
+            result[key] = {
+                "old": old_val,
+                "new": new_val,
+                "verdict": _axis_verdict(old_val, new_val, higher_is_better=True),
+            }
     # Token axes that reflect a skill-wording change: uncached input (a shorter
     # skill means less context every turn), output, reasoning, and billed total.
     for axis in (
@@ -925,12 +1055,39 @@ def partition_cases(old_cases: list[str], new_cases: list[str]) -> dict:
 
 
 def _cell(experiment: dict, test_case: str, configuration: str) -> dict:
-    return (
+    raw = (
         experiment.get("aggregates", {})
         .get("cells", {})
         .get(test_case, {})
         .get(configuration, {})
     )
+    if not raw:
+        return {}
+    cell = dict(raw)
+    if "mean_deterministic_score" not in cell and experiment.get("results"):
+        trials = [
+            r
+            for r in experiment.get("results", [])
+            if r.get("test_case") == test_case
+            and r.get("configuration") == configuration
+        ]
+        det_scores = [
+            r["deterministic_score"]
+            for r in trials
+            if isinstance(r.get("deterministic_score"), (int, float))
+        ]
+        sem_scores = [
+            r["semantic_score"]
+            for r in trials
+            if isinstance(r.get("semantic_score"), (int, float))
+        ]
+        cell["mean_deterministic_score"] = (
+            round(sum(det_scores) / len(det_scores), 2) if det_scores else None
+        )
+        cell["mean_semantic_score"] = (
+            round(sum(sem_scores) / len(sem_scores), 2) if sem_scores else None
+        )
+    return cell
 
 
 def _confounds(old_rep: dict, new_rep: dict) -> list[str]:
@@ -999,32 +1156,23 @@ def render_comparison_markdown(
     new_model = provenance.get("new_model") or "not captured"
     old_effort = provenance.get("old_effort") or "not captured"
     new_effort = provenance.get("new_effort") or "not captured"
+    config = provenance.get("config") or "with-skill"
     models_match = (
         provenance.get("old_model")
         and provenance.get("new_model")
         and provenance["old_model"] == provenance["new_model"]
         and provenance.get("old_effort") == provenance.get("new_effort")
     )
+    cost_model = (
+        provenance.get("old_model")
+        if provenance.get("old_model") == provenance.get("new_model")
+        and provenance.get("old_model") in PRICING
+        else None
+    )
 
+    title_suffix = f" ({config})" if config != "with-skill" else ""
     lines = [
-        f"# Comparison: {skill} — {old_id} (v1) vs {new_id} (v2)",
-        "",
-        "Read-only diff of two experiments of the same skill suite. Cases are "
-        "matched by name; only shared cases are compared. Every per-case number "
-        "is a MEAN over that cell's trials (shown as `n=` in each case header).",
-        "",
-        "Token terms: `billed output` = output + reasoning (reasoning bills as "
-        "output); `uncached input` = input - cached. On the token axes, LOWER is "
-        "better (fewer tokens for an equal-or-better score is the optimisation "
-        "win). Token counts are only comparable across runs on the SAME model and "
-        "reasoning effort — see the setup row below.",
-        "",
-        f"The `est. API-equiv. cost` row is an **estimate at public API list "
-        f"prices** (as of {PRICING_AS_OF}, {PRICING_SOURCE}) — NOT actual "
-        f"subscription or credit spend, and shown only when both experiments ran "
-        f"on the same priced model. The short-/long-context rate is auto-selected "
-        f"per cell at {LONG_CONTEXT_THRESHOLD:,} input tokens. It is a "
-        f"model-agnostic unit for comparing v1 against v2.",
+        f"# Comparison: {skill}{title_suffix} — {old_id} (v1) vs {new_id} (v2)",
         "",
         "| Setup | v1 (" + old_id + ") | v2 (" + new_id + ") |",
         "|---|---|---|",
@@ -1032,8 +1180,10 @@ def render_comparison_markdown(
         f"| Reasoning effort | {old_effort} | {new_effort} |",
         f"| Trials per cell | {old_trials if old_trials is not None else '?'} "
         f"| {new_trials if new_trials is not None else '?'} |",
-        "",
     ]
+    if config != "with-skill":
+        lines.append(f"| Configuration | {config} | {config} |")
+    lines.append("")
     if not models_match:
         lines.append(
             "> WARNING: model and/or reasoning effort differ between the two "
@@ -1058,8 +1208,52 @@ def render_comparison_markdown(
         lines.append("> WARNING: test-case sets differ; aggregate comparison is weakened.")
         lines.append("")
 
+    if rows:
+        lines.append("## Case overview")
+        lines.append("")
+        lines.append(
+            "| Test case | Score (v1 -> v2) | Pass rate | Billed out (v1 -> v2) "
+            "| Est. cost (v1 -> v2) | Score verdict |"
+        )
+        lines.append("|---|---|---|---|---|---|")
+        for row in rows:
+            diff = row["diff"]
+            sc = diff.get("score", {})
+            sc_text = f"{_fmt(sc.get('old'))} -> {_fmt(sc.get('new'))}"
+            if sc.get("old") is not None and sc.get("new") is not None and sc["old"] != sc["new"]:
+                sc_text += f" ({sc['new'] - sc['old']:+g})"
+            n_old = diff.get("n_old", 0)
+            n_new = diff.get("n_new", 0)
+            p_old = diff.get("passed_old")
+            p_new = diff.get("passed_new")
+            if p_old is not None and p_new is not None and n_old and n_new:
+                pr_text = f"{p_old}/{n_old} -> {p_new}/{n_new}"
+            else:
+                pr = diff.get("pass_rate", {})
+                pr_text = f"{_fmt(pr.get('old'))} -> {_fmt(pr.get('new'))}"
+            bo = diff.get("billed_output_tokens", {})
+            bo_text = f"{_fmt(bo.get('old'))} -> {_fmt(bo.get('new'))}"
+            if bo.get("old") and bo.get("new") is not None:
+                pct = (bo["new"] - bo["old"]) / bo["old"] * 100
+                bo_text += f" ({pct:+.1f}%)"
+            c_old = estimate_api_cost(diff.get("_mean_tokens_old", {}), cost_model)
+            c_new = estimate_api_cost(diff.get("_mean_tokens_new", {}), cost_model)
+            if c_old is not None and c_new is not None:
+                cost_text = f"{format_cost(c_old)} -> {format_cost(c_new)}"
+                if c_old:
+                    cost_text += f" ({(c_new - c_old) / c_old * 100:+.1f}%)"
+            else:
+                cost_text = "n/a"
+            lines.append(
+                f"| {row['test_case']} | {sc_text} | {pr_text} | {bo_text} "
+                f"| {cost_text} | {sc.get('verdict', 'n/a')} |"
+            )
+        lines.append("")
+
     AXES = [
         ("score", "score"),
+        ("deterministic_score", "det score"),
+        ("semantic_score", "sem score"),
         ("pass_rate", "pass rate"),
         ("uncached_input_tokens", "uncached input"),
         ("output_tokens", "output"),
@@ -1085,14 +1279,6 @@ def render_comparison_markdown(
                 f"| {label} | {_fmt(a['old'])} | {_fmt(a['new'])} | "
                 f"{format_delta(a['old'], a['new'])} | {a['verdict']} |"
             )
-        # API-equivalent cost row: only when BOTH experiments ran on the same
-        # priced model (otherwise the figure would mix rate cards or be a guess).
-        cost_model = (
-            provenance.get("old_model")
-            if provenance.get("old_model") == provenance.get("new_model")
-            and provenance.get("old_model") in PRICING
-            else None
-        )
         cost_old = estimate_api_cost(diff.get("_mean_tokens_old", {}), cost_model)
         cost_new = estimate_api_cost(diff.get("_mean_tokens_new", {}), cost_model)
         if cost_old is not None and cost_new is not None:
@@ -1101,7 +1287,7 @@ def render_comparison_markdown(
             cost_verdict = "n/a"
         lines.append(
             f"| est. API-equiv. cost | {format_cost(cost_old)} | "
-            f"{format_cost(cost_new)} | {format_delta(cost_old, cost_new)} | "
+            f"{format_cost(cost_new)} | {format_cost_delta(cost_old, cost_new)} | "
             f"{cost_verdict} |"
         )
         lines.append("")
@@ -1122,12 +1308,20 @@ def render_comparison_markdown(
         lines.append("_No skill-language diff available "
                      "(snapshots missing or identical)._")
     lines.append("")
+    lines.append(
+        f"_Every per-case number is a MEAN over that cell's trials; "
+        f"`billed output` = output + reasoning (lower is better on token/cost axes); "
+        f"`est. API-equiv. cost` is an estimate at public API list prices "
+        f"({PRICING_AS_OF}, {PRICING_SOURCE}) — NOT actual subscription or credit spend._"
+    )
+    lines.append("")
     return "\n".join(lines)
 
 
 def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     if args.skill not in skills:
         fail(f"no evaluation for {args.skill}; available: {', '.join(skills) or 'none'}")
+    config = getattr(args, "config", "with-skill") or "with-skill"
     runs_root = skills[args.skill] / "runs"
     old_path = runs_root / args.old / "experiment.json"
     new_path = runs_root / args.new / "experiment.json"
@@ -1144,14 +1338,26 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
         print("No shared test cases to compare.")
         return 1
 
+    missing_config = [
+        tc for tc in partition["both"]
+        if not _cell(old, tc, config) or not _cell(new, tc, config)
+    ]
+    if len(missing_config) == len(partition["both"]):
+        fail(
+            f"configuration '{config}' is missing in one or both experiments "
+            f"({args.old}, {args.new})"
+        )
+
     improved = regressed = 0
     rows: list[dict] = []
     for test_case in partition["both"]:
-        old_cell = _cell(old, test_case, "with-skill")
-        new_cell = _cell(new, test_case, "with-skill")
+        old_cell = _cell(old, test_case, config)
+        new_cell = _cell(new, test_case, config)
+        if not old_cell or not new_cell:
+            continue
         diff = compare_cell(old_cell, new_cell)
-        old_rep = _case_representative(old, test_case, "with-skill")
-        new_rep = _case_representative(new, test_case, "with-skill")
+        old_rep = _case_representative(old, test_case, config)
+        new_rep = _case_representative(new, test_case, config)
         confounds = _confounds(old_rep, new_rep)
         rows.append({"test_case": test_case, "diff": diff, "confounds": confounds})
         if diff["score"]["verdict"] == "improved":
@@ -1159,23 +1365,28 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
         elif diff["score"]["verdict"] == "regressed":
             regressed += 1
 
-    unchanged = len(partition["both"]) - improved - regressed
-    skill_diff = _skill_diff(
-        _case_representative(old, partition["both"][0], "with-skill"),
-        _case_representative(new, partition["both"][0], "with-skill"),
+    unchanged = len(rows) - improved - regressed
+    skill_diff = (
+        _skill_diff(
+            _case_representative(old, partition["both"][0], "with-skill"),
+            _case_representative(new, partition["both"][0], "with-skill"),
+        )
+        if config == "with-skill"
+        else []
     )
 
     # Provenance for the comparability caveat: model + reasoning effort actually
     # resolved, read from a representative trial of each experiment, plus trials
     # per cell. Token/score comparisons are only valid on the same model/effort.
-    old_rep0 = _case_representative(old, partition["both"][0], "with-skill")
-    new_rep0 = _case_representative(new, partition["both"][0], "with-skill")
+    old_rep0 = _case_representative(old, partition["both"][0], config)
+    new_rep0 = _case_representative(new, partition["both"][0], config)
     provenance = {
         "old_model": old_rep0.get("resolved_model"),
         "new_model": new_rep0.get("resolved_model"),
         "old_effort": old_rep0.get("resolved_reasoning_effort"),
         "new_effort": new_rep0.get("resolved_reasoning_effort"),
         "trials": {"old": old.get("trials"), "new": new.get("trials")},
+        "config": config,
     }
 
     # Write the full report to a comparisons/ dir that is a sibling of runs/, so
@@ -1187,13 +1398,15 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
     )
     comparisons_root = skills[args.skill] / "comparisons"
     comparisons_root.mkdir(parents=True, exist_ok=True)
-    out_path = comparisons_root / f"{args.old}-vs-{args.new}.md"
+    suffix = "-baseline" if config == "baseline" else ""
+    out_path = comparisons_root / f"{args.old}-vs-{args.new}{suffix}.md"
     out_path.write_text(markdown, encoding="utf-8")
 
     # Terminal stays short: the detail lives in the file.
-    print(f"Comparing {args.skill}: {args.old} (v1) -> {args.new} (v2)")
+    cfg_label = f" ({config})" if config != "with-skill" else ""
+    print(f"Comparing {args.skill}{cfg_label}: {args.old} (v1) -> {args.new} (v2)")
     print(
-        f"  {len(partition['both'])} shared case(s): "
+        f"  {len(rows)} shared case(s): "
         f"{improved} improved, {regressed} regressed, {unchanged} unchanged (by score)"
     )
     if partition["only_old"] or partition["only_new"]:

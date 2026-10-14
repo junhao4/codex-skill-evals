@@ -61,7 +61,7 @@ To evaluate a skill:
 
 1. create an evaluation folder with the same name as the skill;
 2. add one or more test cases;
-3. use `eval.py` to list, check, or run them.
+3. use `eval.py` to list, check, run, or compare them.
 
 Adding a skill or test case does not require changes to `eval.py` or `_lib/`.
 
@@ -95,7 +95,8 @@ Create the skill and a matching evaluation directory:
     ├── _lib/               # internal harness implementation
     └── <skill-name>/
         ├── test-cases/
-        └── runs/              # generated automatically after eval is run
+        ├── runs/              # generated automatically after eval is run
+        └── comparisons/       # generated automatically by eval.py compare
 ```
 
 | Path | Required? | Purpose |
@@ -103,6 +104,7 @@ Create the skill and a matching evaluation directory:
 | `.agents/skills/<skill-name>/SKILL.md` | Yes | The skill being evaluated—the system under test |
 | `.agents/evals/<skill-name>/test-cases/` | Yes | Holds the scenarios used to evaluate that skill |
 | `.agents/evals/<skill-name>/runs/` | Generated | Numbered experiments, human-readable reports, workspaces, traces, and grades |
+| `.agents/evals/<skill-name>/comparisons/` | Generated | Cross-experiment comparison reports (`<old>-vs-<new>.md`) |
 
 The two `<skill-name>` directory names must match exactly. A skill also needs at
 least one valid test case before it can be run. You do not manually populate
@@ -125,7 +127,8 @@ keep this README focused on getting started:
 - [Authoring test cases](docs/authoring.md) — fixtures, prompts, graders
   (`check.py` and `expected.md`), supporting skills, and multi-turn
   interactions.
-- [Running evaluations](docs/running.md) — the `list`, `check`, and `run`
-  commands, run flags, cost, and how the semantic jury decides pass/fail.
+- [Running evaluations](docs/running.md) — the `list`, `check`, `run`, and
+  `compare` commands, run flags, cost, and how the semantic jury decides
+  pass/fail.
 - [Evaluation outputs](docs/outputs.md) — reference for every file written
-  under `runs/`.
+  under `runs/` and `comparisons/`.
