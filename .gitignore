@@ -1,4 +1,21 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-runs/
+
+# Evaluation run artifacts.
+#
+# Each run writes to runs/<experiment>/ with two kinds of output:
+#   - per-experiment SUMMARIES at the run root (small, human/machine-readable,
+#     worth committing as citable evidence):
+#         runs/<experiment>/report.md         human-readable outcome
+#         runs/<experiment>/experiment.json   complete machine-readable record
+#   - per-TRIAL artifacts under trials/ (large, regenerable, machine-only:
+#     copied fixtures, worker traces, git patches, per-judge grader output).
+#
+# Ignore only the per-trial bulk. The summaries sit at the run root (not under
+# trials/), so they stay tracked automatically — no negation needed.
+runs/*/trials/
+
+# Comparison summaries (v1-vs-v2 result reports) are small and citable — keep
+# them tracked. To ignore them instead, uncomment the next line.
+# comparisons/
