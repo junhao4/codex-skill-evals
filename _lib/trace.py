@@ -315,6 +315,58 @@ def _extract_collab_item(event: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _collab_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize legacy calls and named collaboration function/activity events.
+
+    A spawn request alone is not execution evidence: require its matching
+    started activity. A receiver-less wait is linked only to children observed
+    completing during that wait, never to every known child.
+    """
+    calls: dict[str, dict[str, Any]] = {}
+    requests: dict[str, dict[str, Any]] = {}
+    wait_starts: dict[str, int] = {}
+    completions: list[str] = []
+    for event in events:
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "function_call" and payload.get("namespace") == "collaboration":
+            try:
+                args = json.loads(payload.get("arguments", "{}"))
+            except (ValueError, TypeError):
+                args = {}
+            call_id = payload.get("call_id")
+            requests[call_id] = args if isinstance(args, dict) else {}
+            if payload.get("name") == "wait_agent":
+                wait_starts[call_id] = len(completions)
+        item = payload.get("item", event.get("item", {}))
+        if isinstance(item, dict) and item.get("type") == "SubAgentActivity":
+            tid = item.get("agent_thread_id")
+            if isinstance(tid, str) and item.get("kind") == "started":
+                call_id = item.get("id")
+                args = requests.get(call_id, {})
+                calls[call_id] = {
+                    "id": call_id, "tool": "spawn_agent", "status": "completed",
+                    "receiver_thread_ids": [tid], "agents_states": {},
+                    "agent_role": args.get("agent_type"), "fork_turns": args.get("fork_turns"),
+                }
+            elif isinstance(tid, str) and item.get("kind") == "completed":
+                completions.append(tid)
+                calls["completed:" + tid] = {
+                    "tool": "activity", "receiver_thread_ids": [],
+                    "agents_states": {tid: "completed"},
+                }
+        call = _extract_collab_item(event)
+        if call is not None:
+            key = call.get("id") or str(len(calls))
+            if call.get("tool") in COLLAB_WAIT_TOOLS and not call["receiver_thread_ids"]:
+                start = wait_starts.get(call.get("id"))
+                if start is not None and call.get("status") == "completed":
+                    call["receiver_thread_ids"] = list(dict.fromkeys(completions[start:]))
+            calls[key] = {**calls.get(key, {}), **call}
+    return list(calls.values())
+
+
 def _summarize_collab_calls(
     collab_calls: list[dict[str, Any]],
     default_parent_tid: str | None = None,
@@ -348,6 +400,10 @@ def _summarize_collab_calls(
                     "final_message": None,
                 }
             entry = child_meta[tid]
+            if call.get("agent_role"):
+                entry["agent_role"] = call["agent_role"]
+            if call.get("fork_turns") is not None:
+                entry["fork_turns"] = call["fork_turns"]
             if sender and not entry.get("parent_thread_id"):
                 entry["parent_thread_id"] = sender
             if tool == "spawn_agent" and call.get("prompt") and not entry.get("prompt"):
@@ -474,9 +530,19 @@ def trace_metrics(trace: Path, skill_name: str | None = None) -> dict[str, Any]:
         skill_read_observed = any(
             skill_name.lower() in command.lower() and "skill.md" in command.lower()
             for command in command_texts
+        ) or any(
+            payload.get("type") == "message" and payload.get("role") == "user"
+            and any(isinstance(block, dict) and isinstance(block.get("text"), str)
+                    and "<skill>" in block["text"]
+                    and f"<name>{skill_name}</name>" in block["text"]
+                    and "</skill>" in block["text"]
+                    and "\n---\n" in block["text"]
+                    for block in payload.get("content", []))
+            for event in events for payload in [event.get("payload", {})]
+            if isinstance(payload, dict)
         )
 
-    collab_summary = _summarize_collab_calls(collab_calls, default_parent_tid=parent_tid)
+    collab_summary = _summarize_collab_calls(_collab_calls(events), default_parent_tid=parent_tid)
     if turn_completed_seen:
         token_usage = _finalize_token_usage(
             input_tokens,
@@ -560,6 +626,7 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
     tc_reasoning = 0
     latest_total_usage: dict[str, Any] | None = None
 
+    events: list[dict[str, Any]] = []
     for line in rollout.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -570,6 +637,7 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
             continue
         if not isinstance(event, dict):
             continue
+        events.append(event)
         event_count += 1
         ev_type = event.get("type")
 
@@ -586,6 +654,8 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
                     agent_nickname = payload["agent_nickname"]
                 if isinstance(payload.get("agent_role"), str):
                     agent_role = payload["agent_role"]
+                elif isinstance(payload.get("agent_type"), str):
+                    agent_role = payload["agent_type"]
                 source = payload.get("source")
                 if isinstance(source, dict):
                     sub = source.get("subagent")
@@ -602,6 +672,8 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
                                 agent_nickname = spawn["agent_nickname"]
                             if isinstance(spawn.get("agent_role"), str):
                                 agent_role = spawn["agent_role"]
+                            elif isinstance(spawn.get("agent_type"), str):
+                                agent_role = spawn["agent_type"]
         elif ev_type == "turn_context":
             payload = event.get("payload", event)
             if isinstance(payload, dict):
@@ -665,6 +737,7 @@ def read_rollout_metrics(rollout: Path) -> dict[str, Any]:
     else:
         token_usage = _empty_token_usage()
 
+    collab_calls = _collab_calls(events)
     collab_summary = _summarize_collab_calls(collab_calls, default_parent_tid=thread_id)
     return {
         "thread_id": thread_id,
@@ -776,7 +849,7 @@ def capture_subagent_rollouts(
                 "parent_thread_id": resolved_parent,
                 "depth": resolved_depth,
                 "agent_nickname": info["agent_nickname"],
-                "agent_role": info["agent_role"],
+                "agent_role": info["agent_role"] or stub.get("agent_role"),
                 "model": info["model"],
                 "reasoning_effort": info["reasoning_effort"],
                 "prompt": stub.get("prompt"),
@@ -807,7 +880,7 @@ def capture_subagent_rollouts(
                 "parent_thread_id": inferred_parent,
                 "depth": inferred_depth,
                 "agent_nickname": None,
-                "agent_role": None,
+                "agent_role": stub.get("agent_role"),
                 "model": None,
                 "reasoning_effort": None,
                 "prompt": stub.get("prompt"),
