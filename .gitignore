@@ -21,3 +21,9 @@ __pycache__/
 # Comparison summaries (v1-vs-v2 result reports) are small and citable — keep
 # them tracked. To ignore them instead, uncomment the next line.
 # **/comparisons/
+
+# Per-project live usage reports and incremental rollout cache (auto-updated on
+# every Codex turn from ~/.codex/sessions/; ignored by default so ordinary turns
+# do not dirty `git status`).
+**/_usage/
+/_usage/

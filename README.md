@@ -32,13 +32,24 @@ mkdir -p .agents
 npx degit junhao4/codex-skill-evals .agents/evals
 ```
 
-Then verify it from the same project root:
+Then run `setup` from the same project root to enable automatic per-project
+Codex session usage tracking and verify the installation:
 
 ```bash
-python3 .agents/evals/eval.py list
+python3 .agents/evals/eval.py setup
 ```
 
-`list` makes no model calls. If it runs, the harness is installed correctly.
+`setup` makes no model calls. It:
+
+1. adds `notify = ["python3", ".agents/evals/eval.py", "usage", "--quiet"]` to
+   `.codex/config.toml` (creating it or preserving existing settings);
+2. backfills past Codex sessions for this project into `.agents/evals/_usage/`
+   (`report.html`, `report.md`, and `summary.json`), excluding synthetic
+   `eval.py run` trial workspaces and other repositories; and
+3. lists any discovered skill evaluations.
+
+If you only want to check discovered evaluations without setting up the
+per-project usage report, run `python3 .agents/evals/eval.py list`.
 
 **Install notes**
 
@@ -93,6 +104,7 @@ Create the skill and a matching evaluation directory:
 └── evals/
     ├── eval.py             # command-line entry point
     ├── _lib/               # internal harness implementation
+    ├── _usage/             # auto-updated project session usage reports
     └── <skill-name>/
         ├── test-cases/
         ├── runs/              # generated automatically after eval is run
@@ -127,8 +139,8 @@ keep this README focused on getting started:
 - [Authoring test cases](docs/authoring.md) — fixtures, prompts, graders
   (`check.py` and `expected.md`), subagent/orchestrator skills, supporting
   skills, and multi-turn interactions.
-- [Running evaluations](docs/running.md) — the `list`, `check`, `run`, and
-  `compare` commands, run flags, cost, and how the semantic jury decides
-  pass/fail.
+- [Running evaluations](docs/running.md) — the `setup`, `usage`, `list`,
+  `check`, `run`, and `compare` commands, run flags, cost, and how the semantic
+  jury decides pass/fail.
 - [Evaluation outputs](docs/outputs.md) — reference for every file written
-  under `runs/` and `comparisons/`.
+  under `runs/`, `comparisons/`, and `_usage/`.

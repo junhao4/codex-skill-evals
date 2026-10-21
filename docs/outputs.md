@@ -101,3 +101,15 @@ The following grader directories are optional and therefore appear last:
 
 Every worker trial begins from a fresh fixture copy. Repeated trials never share
 a workspace, and neither workers nor judges modify the original fixture.
+
+### Project usage reports (`.agents/evals/_usage/`)
+
+Running `python3 .agents/evals/eval.py setup` or `python3 .agents/evals/eval.py usage`
+writes per-project real-work usage files under `.agents/evals/_usage/`:
+
+| Output | Tracked in Git? | Meaning |
+|---|---:|---|
+| `_usage/report.html` | Optional | Self-contained interactive HTML dashboard with KPI cards, project skill & subagent usage tables, model mix, daily token bars, and a filterable session log |
+| `_usage/report.md` | Optional | Markdown summary of the same project-scoped session, skill, subagent, model, and daily metrics |
+| `_usage/summary.json` | Optional | Machine-readable aggregate metrics and per-session records |
+| `_usage/cache.json` | Ignored | Incremental `(mtime_ns, size)` parse cache for `~/.codex/sessions/` rollouts |

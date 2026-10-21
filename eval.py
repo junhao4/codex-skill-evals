@@ -76,6 +76,19 @@ from _lib.trace import (  # noqa: E402, F401
     read_rollout_metrics,
     read_skill_snapshot_text,
 )
+from _lib.usage import (  # noqa: E402, F401
+    build_project_usage,
+    configure_codex_notify,
+    generate_usage_report,
+    is_eval_run_cwd,
+    is_project_work_cwd,
+    parse_session_rollout,
+    render_usage_html,
+    render_usage_markdown,
+    resolve_project_root,
+    setup_project_usage,
+    update_rollout_cache,
+)
 
 
 def fail(message: str) -> None:
@@ -142,6 +155,56 @@ def parse_args() -> argparse.Namespace:
         choices=("with-skill", "baseline"),
         default="with-skill",
         help="configuration cell to compare across experiments (default: with-skill)",
+    )
+
+    setup_parser = commands.add_parser(
+        "setup",
+        help="configure .codex/config.toml notify hook and backfill project usage report",
+    )
+    setup_parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="override detected project root",
+    )
+    setup_parser.add_argument(
+        "--sessions-root",
+        type=Path,
+        default=None,
+        help="override ~/.codex/sessions directory",
+    )
+    setup_parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="generate initial usage report without editing .codex/config.toml",
+    )
+
+    usage_parser = commands.add_parser(
+        "usage",
+        help="update project-scoped Codex session usage reports (zero model calls)",
+    )
+    usage_parser.add_argument(
+        "notify_payload",
+        nargs="?",
+        default=None,
+        help="optional JSON event payload appended by Codex notify hook",
+    )
+    usage_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress normal stdout output (used by Codex notify hook)",
+    )
+    usage_parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="override detected project root",
+    )
+    usage_parser.add_argument(
+        "--sessions-root",
+        type=Path,
+        default=None,
+        help="override ~/.codex/sessions directory",
     )
     return parser.parse_args()
 
@@ -396,9 +459,67 @@ def compare_experiments(args: argparse.Namespace, skills: dict[str, Path]) -> in
     return _compare_experiments(args, skills, fail_fn=fail)
 
 
+def setup_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
+    try:
+        result = setup_project_usage(
+            evals_root=EVALS_ROOT,
+            project_root=args.project_root,
+            sessions_root=args.sessions_root,
+            configure_notify=not args.no_notify,
+        )
+    except Exception as error:
+        fail(str(error))
+
+    print(f"Project root: {result['project_root']}")
+    if result["config_path"] is not None:
+        print(f"Codex notify hook: {result['config_path']} ({result['notify_status']})")
+    else:
+        print("Codex notify hook: skipped (--no-notify)")
+    print(
+        f"Project sessions tracked: {result['session_count']} "
+        f"({result['subagent_count']} subagent spawn(s))"
+    )
+    print(f"HTML report: {result['html_path']}")
+    print(f"Markdown report: {result['markdown_path']}")
+    print(f"Summary JSON: {result['summary_path']}\n")
+    return list_evaluations(argparse.Namespace(skill=None), skills)
+
+
+def run_usage(args: argparse.Namespace) -> int:
+    try:
+        result = generate_usage_report(
+            evals_root=EVALS_ROOT,
+            project_root=args.project_root,
+            sessions_root=args.sessions_root,
+            notify_payload=args.notify_payload,
+        )
+    except Exception as error:
+        if args.quiet:
+            return 0
+        fail(str(error))
+
+    if args.quiet:
+        return 0
+    if result.get("skipped"):
+        print(f"Usage report skipped ({result.get('reason', 'not applicable')}).")
+        return 0
+    print(
+        f"Project usage updated: {result['session_count']} session(s), "
+        f"{result['subagent_count']} subagent spawn(s)"
+    )
+    print(f"HTML report: {result['html_path']}")
+    print(f"Markdown report: {result['markdown_path']}")
+    print(f"Summary JSON: {result['summary_path']}")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.command == "usage":
+        return run_usage(args)
     skills = discover_skills(EVALS_ROOT, SKILLS_ROOT)
+    if args.command == "setup":
+        return setup_evaluation(args, skills)
     if args.command == "list":
         return list_evaluations(args, skills)
     if args.command == "check":

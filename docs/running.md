@@ -6,10 +6,12 @@ How to run skill evaluations and interpret the pass/fail decision. See [authorin
 
 Run commands from the repository root.
 
-### The four commands
+### Commands
 
 | Goal | Command | Calls a model? |
 |---|---|---:|
+| Set up auto-updating project usage reports + list skills | `python3 .agents/evals/eval.py setup` | No |
+| Refresh project usage reports on demand | `python3 .agents/evals/eval.py usage` | No |
 | List available skill evaluations | `python3 .agents/evals/eval.py list` | No |
 | List one skill's test cases | `python3 .agents/evals/eval.py list <skill-name>` | No |
 | Structurally validate one evaluation | `python3 .agents/evals/eval.py check <skill-name>` | No |
@@ -172,5 +174,40 @@ effort** — different models or reasoning levels produce different counts for t
 same task. The report's `**Setup:**` header line records the model and reasoning
 effort that actually produced the run (read back from the Codex rollout), so you
 can confirm two runs are comparable.
+
+### Zero-token real-work usage tracking (`eval.py setup` and `eval.py usage`)
+
+In addition to synthetic fixture benchmarks (`eval.py run`), the harness can
+passively track ordinary Codex work in the current project with **zero model
+calls**:
+
+```bash
+# One-time setup: configure .codex/config.toml notify hook and backfill _usage/
+python3 .agents/evals/eval.py setup
+
+# Manual refresh at any time
+python3 .agents/evals/eval.py usage
+```
+
+`setup` configures `.codex/config.toml` with:
+
+```toml
+notify = ["python3", ".agents/evals/eval.py", "usage", "--quiet"]
+```
+
+Whenever a Codex turn finishes in this repository, Codex invokes `eval.py usage
+--quiet` in the background. The collector incrementally parses changed rollout
+files in `~/.codex/sessions/` (caching `(mtime_ns, size)` in
+`.agents/evals/_usage/cache.json`), filters strictly to sessions whose working
+directory is inside this project while excluding synthetic `eval.py run` trial
+workspaces, links spawned subagents to their parent sessions, and updates:
+
+- `.agents/evals/_usage/report.html` — self-contained interactive dashboard
+  (KPI cards, skill trigger breakdown including `0`-trigger installed skills,
+  subagent breakdown including `0`-spawn `.codex/agents/*.toml` profiles, model
+  mix, daily usage bars, and a searchable/filterable session table);
+- `.agents/evals/_usage/report.md` — clean GitHub-flavored Markdown summary; and
+- `.agents/evals/_usage/summary.json` — machine-readable aggregate data.
+
 
 
