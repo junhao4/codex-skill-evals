@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from os.path import relpath
 from pathlib import Path
+import re
+from urllib.parse import quote
 
 from _lib.common import _fmt, markdown_cell, read_json, write_json
+from _lib.paths import trial_directory
 from _lib.grading import score_band
+from _lib.timing import format_seconds, timing_summary, worker_seconds
 from _lib.pricing import (
     PRICING,
     PRICING_AS_OF,
@@ -27,6 +32,40 @@ TOKEN_FIELDS = (
 )
 
 
+def _report_link(label: str, target: Path, root: Path) -> str:
+    if not target.is_absolute():
+        target = root / target
+    relative = Path(relpath(target.resolve(), root.resolve())).as_posix()
+    return f"[{label}]({quote(relative, safe='/')})"
+
+
+def _finding_text(reason: str, run_dir: Path | None, root: Path) -> str:
+    """Link unambiguous workspace file mentions; preserve existing Markdown."""
+    text = markdown_cell(reason)
+    if run_dir is None:
+        return text
+    workspace = (run_dir if run_dir.is_absolute() else root / run_dir) / "workspace"
+    if not workspace.is_dir():
+        return text
+    links = {}
+
+    def replace(match):
+        name = match[0]
+        if name not in links:
+            candidates = [workspace / name] if "/" in name else workspace.rglob(name)
+            matches = [path for path in candidates if path.is_file() and not path.is_symlink()
+                       and path.resolve().is_relative_to(workspace.resolve())]
+            links[name] = _report_link(name, matches[0], root) if len(matches) == 1 else name
+        return links[name]
+
+    # Avoid nesting links or putting link markup inside inline code.
+    parts = re.split(r"(`+[^`]*`+|\[[^\]]*\]\([^)]*\))", text)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(r"(?<![\w./-])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z][A-Za-z0-9]*(?![\w./-])",
+                              replace, parts[index])
+    return "".join(parts)
+
+
 def aggregate(results: list[dict]) -> dict:
     """Summarize repeated trials and baseline-versus-skill differences."""
     cells: dict[str, dict[str, dict]] = {}
@@ -39,12 +78,15 @@ def aggregate(results: list[dict]) -> dict:
                 "det_scores": [],
                 "sem_scores": [],
                 "token_samples": [],
+                "timing_samples": [],
                 "passed_trials": 0,
                 "needs_review_trials": 0,
                 "total_trials": 0,
             },
         )
         cell["total_trials"] += 1
+        # Timing includes failed and abstained trials, unlike score means.
+        cell["timing_samples"].append(result)
         if result.get("needs_review") or result.get("status") == "needs_review":
             # Neither a pass nor a fail: an honest "not enough evidence to
             # decide". Excluded from passed_trials and from the score mean.
@@ -68,6 +110,7 @@ def aggregate(results: list[dict]) -> dict:
     comparisons: dict[str, dict] = {}
     for test_case_name, configurations in cells.items():
         for cell in configurations.values():
+            cell.update(timing_summary(cell.pop("timing_samples")))
             scores = cell.pop("scores")
             det_scores = cell.pop("det_scores")
             sem_scores = cell.pop("sem_scores")
@@ -178,22 +221,40 @@ def write_report(
         f"{len(results)}/{experiment['worker_trials']} | "
         f"{format_cost(total_cost)} |",
         "",
+    ]
+    lines.extend([
+        "## Worker runtime",
+        "",
+        "| Test case | Config | Timed trials | Mean worker time | Min–max |",
+        "|---|---|---:|---:|---|",
+    ])
+    for name, configurations in aggregates.get("cells", {}).items():
+        for config, cell in configurations.items():
+            lines.append(
+                f"| {markdown_cell(name)} | {markdown_cell(config)} | "
+                f"{cell.get('timed_trials', 0)}/{cell['total_trials']} | "
+                f"{format_seconds(cell.get('mean_worker_seconds'))} | "
+                f"{format_seconds(cell.get('min_worker_seconds'))}–"
+                f"{format_seconds(cell.get('max_worker_seconds'))} |"
+            )
+    lines.extend([
+        "",
+        "_Worker time is wall-clock execution across all turns, including tool calls "
+        "and subagent waits; excludes setup, subsequent evidence capture and grading. "
+        "Means and ranges include all timed trials, regardless of outcome; missing timings are N/A._",
+        "",
         "## Trials",
         "",
-    ]
+    ])
     if results:
         lines.extend(
             [
-                "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Evidence |",
-                "|---|---|---:|---:|---:|---:|:--:|:--:|---|",
+                "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Worker time | Evidence |",
+                "|---|---|---:|---:|---:|---:|:--:|:--:|---:|---|",
             ]
         )
         for result in results:
-            run_dir = Path(result["run_directory"])
-            try:
-                details = (run_dir / "result.json").relative_to(experiment_root)
-            except ValueError:
-                details = run_dir / "result.json"
+            run_dir = trial_directory(result)
             result_score = result.get("score")
             shown_score = (
                 result_score if isinstance(result_score, (int, float)) else "—"
@@ -236,7 +297,8 @@ def write_report(
                             if is_review
                             else ("Yes" if result["overall_pass"] else "No")
                         ),
-                        f"[result.json]({details.as_posix()})",
+                        format_seconds(worker_seconds(result)),
+                        _report_link("result.json", run_dir / "result.json", experiment_root),
                     ]
                 )
                 + " |"
@@ -257,14 +319,14 @@ def write_report(
                     if item and item not in combined:
                         combined.append(str(item))
         r_score = r.get("score")
-        run_dir = r.get("run_directory")
+        run_dir = trial_directory(r)
         if (
             not combined
             and isinstance(r_score, (int, float))
             and r_score < 100
             and run_dir
         ):
-            sem_file = Path(run_dir) / "grades" / "semantic" / "result.json"
+            sem_file = run_dir / "grades" / "semantic" / "result.json"
             sem_data = read_json(sem_file) if sem_file.is_file() else None
             if isinstance(sem_data, dict):
                 for j in sem_data.get("judges") or []:
@@ -318,8 +380,9 @@ def write_report(
                 "The trial did not satisfy every configured pass condition."
             ]
             for reason in reasons:
+                shown_reason = _finding_text(reason, trial_directory(result), experiment_root)
                 lines.append(
-                    f"- **{markdown_cell(label)}** (`{tag}`): {markdown_cell(reason)}"
+                    f"- **{markdown_cell(label)}** (`{tag}`): {shown_reason}"
                 )
 
     comparisons = aggregates.get("comparisons", {})
@@ -459,4 +522,3 @@ def finalize_experiment(
     experiment["results"] = results
     write_json(experiment_root / "experiment.json", experiment)
     return aggregates, write_report(experiment_root, experiment, aggregates, results)
-

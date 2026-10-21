@@ -236,9 +236,9 @@ def test_report_renders_det_sem_and_passing_deductions(tmp_path):
     report_path = eval_mod.write_report(tmp_path, experiment, aggregates, results)
     text = report_path.read_text(encoding="utf-8")
 
-    # Trials table includes Det and Sem columns
-    assert "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Evidence |" in text
-    assert "| case-a | baseline | 1 | 95 | 100 | 95 | pass | Yes |" in text
+    # Trials table includes Det, Sem, and Worker time columns
+    assert "| Test case | Config | Trial | Score | Det | Sem | Band | Pass | Worker time | Evidence |" in text
+    assert "| case-a | baseline | 1 | 95 | 100 | 95 | pass | Yes | N/A |" in text
     # Findings section surfaces the 5-pt deduction even though the trial passed
     assert "## Findings" in text
     assert "**case-a / baseline / trial-01** (`PASS, score 95`)" in text

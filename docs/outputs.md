@@ -41,6 +41,24 @@ Open `experiment.json` only when a script needs the data or when you need more
 detail than the report provides. Follow the links in `report.md` into
 `trials/` when investigating a particular result.
 
+When `report.md` or `eval.py compare` reads trial evidence through a recorded
+`run_directory`, the harness resolves relocated checkouts against the active
+evaluation root first and never rewrites historical manifests.
+
+### Worker runtime
+
+`report.md` includes a `Worker runtime` table per cell (`Timed trials`,
+`Mean worker time`, `Min–max`) and a `Worker time` column in `Trials`.
+`comparisons/<old>-vs-<new>.md` adds `Mean worker time (v1 -> v2)` and
+`Time change` (`v2 − v1`; negative means faster).
+
+Worker time is wall-clock execution across all turns, including tool calls and
+subagent waits; it excludes workspace setup, subsequent evidence capture, and
+grading. Means and ranges include all timed trials regardless of pass/fail or
+`needs_review` outcome. Legacy runs that only recorded timing in
+`worker/metrics.json` are read without modifying the saved artifacts; runs
+with no timing data render as `N/A`.
+
 Each trial directory contains:
 
 | Output | Meaning |
@@ -48,6 +66,7 @@ Each trial directory contains:
 | `result.json` | Final trial result, separate grader scores, model, and a `tokens` breakdown (uncached/cached input, output, reasoning, billed output; automatically rolls up parent + spawned subagent usage when subagents ran) |
 | `run.json` | Trial inputs, configuration, initial Git state, skill snapshot paths, invocation mode, turn metadata, thread id, and resolved model/reasoning effort read from the rollout |
 | `skill-snapshot/` | Immutable copy of the injected target skill (and any supporting skills) captured at trial start for `eval.py compare` |
+| `agent-profile-snapshot/` | Immutable copy of any declared `.codex/agents/<name>.toml` profiles injected for the trial |
 | `workspace/` | Final file snapshot left by the worker; its temporary `.git/` is removed after the graders finish |
 | `worker/result.json` | Worker exit status, rolled-up metrics, final Git state, protected-input checks, and untracked paths |
 | `worker/metrics.json` | Normalized trace and token metrics, including `parent_token_usage`, `subagent_token_usage`, `subagent_spawn_count`, `subagent_wait_count`, `subagent_thread_ids`, and `subagents` summary records |

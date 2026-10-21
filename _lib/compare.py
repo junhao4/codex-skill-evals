@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from _lib.common import _fmt, read_json
+from _lib.paths import trial_directory
 from _lib.pricing import (
     PRICING,
     PRICING_AS_OF,
@@ -18,6 +19,7 @@ from _lib.pricing import (
     format_delta,
 )
 from _lib.trace import read_skill_snapshot_text
+from _lib.timing import format_seconds, time_delta, timing_summary
 
 
 # --- Layer 2b: cross-experiment version/regression comparator (read-only) ---
@@ -67,6 +69,16 @@ def compare_cell(old_cell: dict, new_cell: dict) -> dict:
         "n_new": new_cell.get("total_trials", 0),
         "passed_old": old_cell.get("passed_trials", 0),
         "passed_new": new_cell.get("passed_trials", 0),
+        "timed_old": old_cell.get("timed_trials", 0),
+        "timed_new": new_cell.get("timed_trials", 0),
+        "worker_time": {
+            "old": old_cell.get("mean_worker_seconds"),
+            "new": new_cell.get("mean_worker_seconds"),
+            "verdict": _axis_verdict(
+                old_cell.get("mean_worker_seconds"),
+                new_cell.get("mean_worker_seconds"), higher_is_better=False,
+            ),
+        },
         "score": {
             "old": old_score,
             "new": new_score,
@@ -132,6 +144,12 @@ def _cell(experiment: dict, test_case: str, configuration: str) -> dict:
     if not raw:
         return {}
     cell = dict(raw)
+    if "timed_trials" not in cell:
+        cell.update(timing_summary([
+            r for r in experiment.get("results", [])
+            if r.get("test_case") == test_case
+            and r.get("configuration") == configuration
+        ]))
     if "mean_deterministic_score" not in cell and experiment.get("results"):
         trials = [
             r
@@ -169,28 +187,32 @@ def _confounds(old_rep: dict, new_rep: dict) -> list[str]:
     new_fixture = _run_field(new_rep, "fixture_sha256")
     if old_fixture and new_fixture and old_fixture != new_fixture:
         warnings.append("fixture changed")
+    old_profiles = _run_field(old_rep, "agent_profile_sha256") or {}
+    new_profiles = _run_field(new_rep, "agent_profile_sha256") or {}
+    if old_profiles != new_profiles:
+        warnings.append("agent profiles changed")
     return warnings
 
 
 def _run_field(result: dict, field: str):
     """Read a field from a trial's run.json via its run_directory. READ-ONLY."""
-    run_directory = result.get("run_directory")
-    if not run_directory:
+    run_directory = trial_directory(result)
+    if run_directory is None:
         return None
-    metadata = read_json(Path(run_directory) / "run.json") or {}
+    metadata = read_json(run_directory / "run.json") or {}
     return metadata.get(field)
 
 
 def _skill_diff(old_rep: dict, new_rep: dict) -> list[str]:
     """Unified diff of the two experiments' captured SKILL.md snapshots."""
-    old_dir = old_rep.get("run_directory")
-    new_dir = new_rep.get("run_directory")
-    if not old_dir or not new_dir:
+    old_dir = trial_directory(old_rep)
+    new_dir = trial_directory(new_rep)
+    if old_dir is None or new_dir is None:
         return []
-    old_meta = read_json(Path(old_dir) / "run.json") or {}
-    new_meta = read_json(Path(new_dir) / "run.json") or {}
-    old_text = read_skill_snapshot_text(Path(old_dir), old_meta)
-    new_text = read_skill_snapshot_text(Path(new_dir), new_meta)
+    old_meta = read_json(old_dir / "run.json") or {}
+    new_meta = read_json(new_dir / "run.json") or {}
+    old_text = read_skill_snapshot_text(old_dir, old_meta)
+    new_text = read_skill_snapshot_text(new_dir, new_meta)
     if old_text is None or new_text is None or old_text == new_text:
         return []
     return list(
@@ -272,10 +294,10 @@ def render_comparison_markdown(
         lines.append("## Case overview")
         lines.append("")
         lines.append(
-            "| Test case | Score (v1 -> v2) | Pass rate | Billed out (v1 -> v2) "
+            "| Test case | Score (v1 -> v2) | Pass rate | Mean worker time (v1 -> v2) | Time change | Billed out (v1 -> v2) "
             "| Est. cost (v1 -> v2) | Score verdict |"
         )
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for row in rows:
             diff = row["diff"]
             sc = diff.get("score", {})
@@ -305,7 +327,10 @@ def render_comparison_markdown(
             else:
                 cost_text = "n/a"
             lines.append(
-                f"| {row['test_case']} | {sc_text} | {pr_text} | {bo_text} "
+                f"| {row['test_case']} | {sc_text} | {pr_text} | "
+                f"{format_seconds(diff.get('worker_time', {}).get('old'))} -> "
+                f"{format_seconds(diff.get('worker_time', {}).get('new'))} | "
+                f"{time_delta(diff.get('worker_time', {}).get('old'), diff.get('worker_time', {}).get('new'))} | {bo_text} "
                 f"| {cost_text} | {sc.get('verdict', 'n/a')} |"
             )
         lines.append("")
@@ -331,6 +356,17 @@ def render_comparison_markdown(
         lines.append("")
         lines.append("| Axis | v1 | v2 | Change | Verdict |")
         lines.append("|---|---|---|---|---|")
+        timing = diff.get("worker_time", {})
+        lines.append(
+            f"| mean worker time | {format_seconds(timing.get('old'))} | "
+            f"{format_seconds(timing.get('new'))} | "
+            f"{time_delta(timing.get('old'), timing.get('new'))} | "
+            f"{timing.get('verdict', 'unknown')} |"
+        )
+        lines.append(
+            f"| timed trials / total | {diff.get('timed_old', 0)}/{n_old} | "
+            f"{diff.get('timed_new', 0)}/{n_new} | — | — |"
+        )
         for key, label in AXES:
             a = diff.get(key)
             if not a:
@@ -367,6 +403,13 @@ def render_comparison_markdown(
     else:
         lines.append("_No skill-language diff available "
                      "(snapshots missing or identical)._")
+    lines.append("")
+    lines.append(
+        "_Worker time is wall-clock execution, including tool calls and subagent waits; "
+        "excludes setup, subsequent evidence capture and grading. Time change = v2 − v1; "
+        "negative means faster. Means include all timed trials, regardless of outcome; "
+        "missing timings are N/A._"
+    )
     lines.append("")
     lines.append(
         f"_Every per-case number is a MEAN over that cell's trials; "
@@ -489,4 +532,3 @@ def compare_experiments(
         print(f"  Confounded (model/fixture changed): {', '.join(confounded)}")
     print(f"Report: {out_path}")
     return 0
-
