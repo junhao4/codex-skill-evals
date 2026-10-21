@@ -34,6 +34,7 @@ class Case:
     checker: Path | None
     supporting_skills: tuple[Path, ...]
     interactions: tuple[Path, ...]
+    agent_profiles: tuple[Path, ...] = ()
 
 
 class TerminalProgress:

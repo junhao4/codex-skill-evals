@@ -52,6 +52,7 @@ from _lib.harness import (  # noqa: E402, F401
     regrade_with_semantic,
     run_trial,
 )
+from _lib.paths import SKILLS_ROOT  # noqa: E402, F401
 from _lib.pricing import (  # noqa: E402, F401
     LONG_CONTEXT_THRESHOLD,
     PRICING,
@@ -168,10 +169,12 @@ def list_evaluations(args: argparse.Namespace, skills: dict[str, Path]) -> int:
             supporting = (
                 ", ".join(skill.name for skill in case.supporting_skills) or "none"
             )
+            profiles = ", ".join(p.stem for p in case.agent_profiles) or "none"
             print(
                 f"  {case.name}\n"
                 f"    Turns: {1 + len(case.interactions)}\n"
                 f"    Supporting skills: {supporting}\n"
+                f"    Agent profiles: {profiles}\n"
                 f"    Graders: {' + '.join(graders)}"
             )
         return 0
@@ -200,7 +203,7 @@ def check_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
             graders.append("semantic")
         print(
             f"  ✓ {case.name} ({1 + len(case.interactions)} turn(s); "
-            f"{' + '.join(graders)})"
+            f"{len(case.agent_profiles)} agent profile(s); {' + '.join(graders)})"
         )
     print(f"\n{len(cases)} test case definition(s) structurally valid.")
     print("Graders were not executed and no model calls were made.")

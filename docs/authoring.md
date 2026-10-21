@@ -39,7 +39,7 @@ never the original fixture.
 |---|---|
 | It contains the relevant code and task context | The worker must have enough information to do the task |
 | It does not contain `.git/` | The fixture remains an ordinary directory that the main project can track; the harness creates Git history in each disposable copy |
-| It does not contain `.agents/` | The harness controls every repository-local skill exposed to the worker, while private evaluator files remain outside the workspace |
+| It does not contain `.agents/` or `.codex/` | The harness controls injected skills and declared agent profiles; private evaluator files remain outside the workspace |
 
 Different test cases may—and usually should—use different fixture directories.
 
@@ -305,6 +305,26 @@ not also appear under `supporting-skills/`.
 
 Injected target and supporting skills are protected inputs. A trial fails if
 the worker edits or deletes one of them.
+
+### `agent-profiles.json`: optional project agent dependencies
+
+If a test case needs custom subagent profiles from `.codex/agents/<name>.toml`,
+declare them explicitly in `agent-profiles.json`:
+
+```json
+["explorer", "spec_conformance_auditor"]
+```
+
+`eval.py check` verifies that every listed profile exists under `.codex/agents/`.
+At runtime the harness copies those profiles into `workspace/.codex/agents/`,
+snapshots them in `agent-profile-snapshot/`, passes equivalent `-c agents.<name>.*`
+overrides to `codex exec`, and treats them as protected inputs alongside injected
+skills.
+
+Because the setup commit includes `TASK.md`, injected skills, and any declared
+agent profiles, `HEAD` starts one commit ahead of `fixture-target`. In test
+cases that inspect a baseline Git revision, use the `fixture-target` tag rather
+than the later setup commit.
 
 ### `interactions/`: optional multi-turn user messages
 

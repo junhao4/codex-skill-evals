@@ -33,6 +33,7 @@ from _lib.common import (  # noqa: E402, F401
     run_command,
     write_json,
 )
+from _lib.agent_profiles import discover_profiles, inject_profiles, profile_hashes, profile_overrides
 from _lib.git_workspace import (  # noqa: E402, F401
     capture_git_evidence,
     commit_workspace_base,
@@ -122,6 +123,8 @@ def discover_cases(eval_root: Path, skill_root: Path) -> dict[str, Case]:
             raise HarnessError(
                 f"test case {root.name} fixture must not contain .agents"
             )
+        if (fixture / ".codex").exists():
+            raise HarnessError(f"test case {root.name} fixture must not contain .codex; declare agent-profiles.json")
         if not expected.is_file() and not checker.is_file():
             raise HarnessError(
                 f"test case {root.name} needs expected.md, check.py, or both"
@@ -176,6 +179,7 @@ def discover_cases(eval_root: Path, skill_root: Path) -> dict[str, Case]:
             checker=checker if checker.is_file() else None,
             supporting_skills=tuple(supporting_skills),
             interactions=tuple(interactions),
+            agent_profiles=discover_profiles(root, skill_root.parents[2]),
         )
     if not cases:
         raise HarnessError(f"no test cases found in {cases_root}")
@@ -234,6 +238,8 @@ def run_trial(
         shutil.copytree(supporting_skill, injected)
         injected_supporting_skills[supporting_skill.name] = injected
     shutil.copy2(case.prompt, workspace / "TASK.md")
+    injected_profiles = inject_profiles(case.agent_profiles, workspace, run_dir)
+    initial_profile_hashes = profile_hashes(injected_profiles)
 
     # Immutable skill snapshot (Layer 2a). Capture a readable copy of exactly the
     # skill bytes this run injected into a dedicated run-dir location, SEPARATE
@@ -278,6 +284,9 @@ def run_trial(
         "prompt_sha256": prompt_sha256,
         "supporting_skills": [skill.name for skill in case.supporting_skills],
         "supporting_skill_sha256": supporting_skill_sha256,
+        "agent_profiles": [p.stem for p in case.agent_profiles],
+        "agent_profile_sha256": initial_profile_hashes,
+        "agent_profile_snapshot": {p.stem: f"agent-profile-snapshot/{p.name}" for p in case.agent_profiles},
         "interactions": [interaction.name for interaction in case.interactions],
         "worker_turns_planned": 1 + len(case.interactions),
         "model": model or "codex-configured-default",
@@ -356,6 +365,7 @@ def run_trial(
                 worker_command.extend(["--model", model])
             worker_command.extend([thread_id, turn_prompt])
 
+        worker_command[1:1] = profile_overrides(injected_profiles)
         worker = run_command(
             worker_command,
             cwd=workspace,
@@ -430,12 +440,14 @@ def run_trial(
         for name, injected in injected_supporting_skills.items()
     }
     all_supporting_skills_intact = all(supporting_skills_intact.values())
+    profiles_intact = profile_hashes(injected_profiles) == initial_profile_hashes
     final_state["protected_inputs_intact"] = (
-        task_intact and skill_intact and all_supporting_skills_intact
+        task_intact and skill_intact and all_supporting_skills_intact and profiles_intact
     )
     final_state["task_prompt_intact"] = task_intact
     final_state["injected_skill_intact"] = skill_intact
     final_state["supporting_skills_intact"] = supporting_skills_intact
+    final_state["agent_profiles_intact"] = profiles_intact
     worker_result = {
         "exit_code": worker_exit_code,
         "elapsed_seconds": worker_seconds,
@@ -447,6 +459,7 @@ def run_trial(
         "task_prompt_intact": task_intact,
         "injected_skill_intact": skill_intact,
         "supporting_skills_intact": supporting_skills_intact,
+        "agent_profiles_intact": profiles_intact,
         "untracked_files": untracked_files,
     }
     write_json(worker_dir / "result.json", worker_result)
@@ -548,6 +561,7 @@ def run_trial(
         else None,
         "semantic_judges": len(semantic.get("judges", [])),
         "worker_exit_code": worker_exit_code,
+        "worker_elapsed_seconds": worker_seconds,
         "tokens": {
             "input_tokens": metrics.get("input_tokens", 0),
             "cached_input_tokens": metrics.get("cached_input_tokens", 0),
