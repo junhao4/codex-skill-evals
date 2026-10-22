@@ -156,6 +156,16 @@ def _clean_user_prompt(text: str) -> str:
         flags=re.DOTALL,
     )
     cleaned = re.sub(r"<permissions[^>]*>.*?</permissions>", " ", cleaned, flags=re.DOTALL)
+    # Synthetic Codex app/IDE events arrive as user turns but are not real typed
+    # prompts (e.g. <external_codex_apps_open_page>...), so a session's real
+    # first prompt is otherwise masked. Strip any such wrapper event + the
+    # <user_instructions> system block.
+    cleaned = re.sub(
+        r"<external_codex[^>]*>.*?</external_codex[^>]*>", " ", cleaned, flags=re.DOTALL
+    )
+    cleaned = re.sub(
+        r"<user_instructions>.*?</user_instructions>", " ", cleaned, flags=re.DOTALL
+    )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 

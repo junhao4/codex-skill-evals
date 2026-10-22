@@ -996,6 +996,23 @@ def test_summarize_experiment_outcome(tmp_path=None):
     assert out3["outcome"] == "UNKNOWN"
 
 
+def test_clean_user_prompt_drops_synthetic_app_events(tmp_path=None):
+    """TDD: synthetic Codex app/IDE events are not treated as real prompts."""
+    from _lib.usage import _clean_user_prompt
+
+    # A real typed prompt survives cleaning.
+    assert _clean_user_prompt("Use $testskill on this repo") == "Use $testskill on this repo"
+
+    # A message that is ENTIRELY a Codex app wrapper event yields nothing, so a
+    # later real prompt becomes first_prompt instead.
+    assert _clean_user_prompt('<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>') == ""
+    assert _clean_user_prompt("<user_instructions>system boilerplate</user_instructions>") == ""
+
+    # Mixed: real text alongside a stripped wrapper keeps the real text.
+    mixed = '<external_codex_apps_open_page>{}</external_codex_apps_open_page> please summarize rate_limiter.py'
+    assert _clean_user_prompt(mixed) == "please summarize rate_limiter.py"
+
+
 def test_session_trace_timeline_renders_commands(tmp_path):
     """TDD: real-session detail view shows an execution trace of commands."""
     from _lib.usage import (
@@ -1263,6 +1280,7 @@ class UsageTests(unittest.TestCase):
             test_skill_detail_view_lists_sessions,
             test_session_trace_timeline_renders_commands,
             test_eval_trial_view_renders_worker_commands,
+            test_clean_user_prompt_drops_synthetic_app_events,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
