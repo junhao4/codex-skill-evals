@@ -1262,6 +1262,8 @@ def test_benchmarked_skills_table_shows_latest_outcome(tmp_path=None):
     assert "LATEST EVAL" in html
     # banner outcome badge: experiment-001 (sessions[0]) scored 100 -> PASS
     assert "PASS" in html
+    # Overview KPI cards show a mini cost-split bar (worker vs judge)
+    assert "mini-bar" in html
 
 
 import tempfile  # noqa: E402

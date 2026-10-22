@@ -778,11 +778,23 @@ def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
 # Shared chrome                                                               #
 # --------------------------------------------------------------------------- #
 
-def _kpi(label: str, value: str, sub: str = "") -> str:
+def _mini_bar(segments: list[tuple[float, str]]) -> str:
+    """Render a proportional mini bar from (value, css-color) segments."""
+    total = sum(max(v, 0) for v, _ in segments)
+    if total <= 0:
+        return ""
+    parts = "".join(
+        f"<div style='width:{max(v, 0) / total * 100:.1f}%;background:{color};'></div>"
+        for v, color in segments
+    )
+    return f"<div class='mini-bar'>{parts}</div>"
+
+
+def _kpi(label: str, value: str, sub: str = "", bar: str = "") -> str:
     sub_html = f"<div class='kpi-sub'>{sub}</div>" if sub else ""
     return (
         f"<div class='kpi-card'><div class='kpi-label'>{_esc(label)}</div>"
-        f"<div class='kpi-value'>{value}</div>{sub_html}</div>"
+        f"<div class='kpi-value'>{value}</div>{sub_html}{bar}</div>"
     )
 
 
@@ -819,6 +831,14 @@ def render_usage_html(summary: dict[str, Any]) -> str:
 
     real_cost = _cost(totals["est_cost"], zero_ok=totals["session_count"] > 0)
     eval_cost = _cost(etotals["est_cost"], zero_ok=etotals["total_call_count"] > 0)
+    real_cost_bar = _mini_bar([
+        (totals.get("parent_est_cost") or 0.0, "var(--primary)"),
+        (totals.get("subagent_est_cost") or 0.0, "var(--indigo)"),
+    ])
+    eval_cost_bar = _mini_bar([
+        (etotals.get("worker_est_cost") or 0.0, "var(--primary)"),
+        (etotals.get("judge_est_cost") or 0.0, "var(--amber)"),
+    ])
     combined_cost = _cost(
         combined.get("est_cost"),
         zero_ok=(totals["session_count"] + etotals["total_call_count"]) > 0,
@@ -920,7 +940,7 @@ def render_usage_html(summary: dict[str, Any]) -> str:
     <div id="real-overview">
       {real_banner}
       <div class="kpi-grid">
-        {_kpi("Total Est. Cost", real_cost, f"{totals['session_count']} sessions · {totals['subagent_spawn_count']} subagents")}
+        {_kpi("Total Est. Cost", real_cost, f"{totals['session_count']} sessions · {totals['subagent_spawn_count']} subagents", bar=real_cost_bar)}
         {_kpi("Billed Output", _num(tok['billed_output_tokens']), f"{totals['cache_hit_pct']}% cache hit")}
         {_kpi("Uncached Input", _num(tok['uncached_input_tokens']), f"{_num(tok['cached_input_tokens'])} cached")}
         {_kpi("Turns / Commands", str(totals['turn_count']), f"{totals['command_count']} cmds ({totals['failed_command_count']} failed)")}
@@ -968,7 +988,7 @@ def render_usage_html(summary: dict[str, Any]) -> str:
     <div id="eval-overview">
       {eval_banner}
       <div class="kpi-grid">
-        {_kpi("Eval Est. Cost", eval_cost, f"{etotals['total_call_count']} total calls")}
+        {_kpi("Eval Est. Cost", eval_cost, f"{etotals['total_call_count']} total calls", bar=eval_cost_bar)}
         {_kpi("Worker Trials", str(etotals['worker_session_count']), f"{etotals['subagent_spawn_count']} subagents")}
         {_kpi("Semantic Judges", str(etotals['judge_call_count']), "grading calls")}
         {_kpi("Eval Billed Output", _num(etok['billed_output_tokens']), f"{etotals['cache_hit_pct']}% cache hit")}
@@ -1059,6 +1079,9 @@ body { margin:0; background:var(--bg); color:var(--text); line-height:1.5; }
   color:var(--text-muted); font-weight:600; }
 .kpi-value { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; margin-top:6px; }
 .kpi-sub { font-size:12px; color:var(--text-muted); margin-top:4px; }
+.mini-bar { display:flex; height:6px; border-radius:3px; overflow:hidden; margin-top:8px;
+  background:#e2e8f0; }
+.mini-bar > div { height:100%; }
 .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
   padding:16px 18px; margin-bottom:18px; }
 .card-header { display:flex; justify-content:space-between; align-items:flex-start;
