@@ -1232,6 +1232,7 @@ def _collect_harness_eval_usage(
                 "turn_count": turns,
                 "command_count": cmds,
                 "failed_command_count": failed_cmds,
+                "commands": root.get("commands") or [],
                 "first_prompt": root.get("first_prompt") or "",
                 "subagent_spawn_count": spawns,
                 "subagents": subagent_records,

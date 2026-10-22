@@ -1077,6 +1077,56 @@ def test_session_trace_timeline_renders_commands(tmp_path):
     assert "exit 1" in html
 
 
+def test_eval_trial_view_renders_worker_commands(tmp_path=None):
+    """TDD: eval trial trace embeds the worker's actual commands."""
+    from _lib.usage_html import render_usage_html
+
+    empty_tok = {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0}
+    trial = {
+        "thread_id": "t1", "started_at": "2026-04-20T11:00:00Z", "date": "2026-04-20",
+        "cwd": "/x", "eval_skill": "demo-skill", "experiment": "experiment-001",
+        "test_case": "case-1", "configuration": "with-skill", "trial": "trial-01",
+        "model": "gpt-5.4", "reasoning_effort": "high", "turn_count": 1,
+        "command_count": 2, "failed_command_count": 1,
+        "commands": [
+            {"command": "WORKERCMD_build.sh", "status": "completed", "exit_code": 0},
+            {"command": "WORKERCMD_lint.sh", "status": "completed", "exit_code": 2},
+        ],
+        "first_prompt": "do it", "subagent_spawn_count": 0, "subagents": [],
+        "judge_call_count": 0, "judge_tokens": empty_tok, "judge_est_cost": None,
+        "parent_token_usage": empty_tok, "subagent_token_usage": empty_tok,
+        "worker_tokens": empty_tok, "worker_est_cost": 0.001,
+        "token_usage": empty_tok, "est_cost": 0.001,
+        "grades": {"deterministic": None, "semantic": None},
+    }
+    summary = {
+        "project_name": "demo", "project_root": "/x", "generated_at": "2026-04-20T12:00:00Z",
+        "totals": {
+            "session_count": 0, "turn_count": 0, "command_count": 0, "failed_command_count": 0,
+            "subagent_spawn_count": 0, "cache_hit_pct": 0.0, "parent_tokens": empty_tok,
+            "subagent_tokens": empty_tok, "tokens": empty_tok, "parent_est_cost": None,
+            "subagent_est_cost": None, "est_cost": None, "priced_sessions": 0,
+        },
+        "skills": [], "subagents": [], "models": [], "daily": [], "sessions": [],
+        "harness_evals": {
+            "totals": {
+                "worker_session_count": 1, "subagent_spawn_count": 0, "judge_call_count": 0,
+                "total_call_count": 1, "turn_count": 1, "worker_turn_count": 1, "judge_turn_count": 0,
+                "command_count": 2, "failed_command_count": 1, "cache_hit_pct": 0.0,
+                "worker_tokens": empty_tok, "judge_tokens": empty_tok, "tokens": empty_tok,
+                "worker_est_cost": 0.001, "judge_est_cost": None, "est_cost": 0.001, "priced_calls": 1,
+            },
+            "by_skill": [], "subagents": [], "models": [], "sessions": [trial],
+        },
+        "combined_totals": {"est_cost": 0.001, "tokens": empty_tok, "cache_hit_pct": 0.0},
+    }
+
+    html = render_usage_html(summary)
+    assert "WORKERCMD_build.sh" in html
+    assert "WORKERCMD_lint.sh" in html
+    assert "exit 2" in html
+
+
 def test_skill_detail_view_lists_sessions(tmp_path=None):
     """TDD: each triggered skill has its own detail view listing its sessions."""
     from _lib.usage_html import render_usage_html
@@ -1212,6 +1262,7 @@ class UsageTests(unittest.TestCase):
             test_benchmarked_skills_table_shows_latest_outcome,
             test_skill_detail_view_lists_sessions,
             test_session_trace_timeline_renders_commands,
+            test_eval_trial_view_renders_worker_commands,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))

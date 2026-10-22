@@ -750,6 +750,8 @@ def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
             f"</div>"
             f"{grade_section}"
             f"<h4>Trial trace</h4><div class='trace-timeline'>{trace_html}</div>"
+            f"<h4>Worker commands ({t['command_count']})</h4>"
+            f"{_command_timeline(t.get('commands') or [])}"
             f"<h4>Subagents ({t['subagent_spawn_count']})</h4>{sub_table}"
             f"</div></div>"
         )
