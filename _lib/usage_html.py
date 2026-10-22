@@ -374,6 +374,12 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
             f"{oc['trials_passed']}/{oc['trials_total']} trials passed · {det_sem_txt}"
         )
         billed_sub = f"{_num(billed)} billed out"
+        # Setup card: model / reasoning effort / trials-per-cell (from trials)
+        models = sorted({t["model"] or "unknown" for t in trials})
+        efforts = sorted({t.get("reasoning_effort") or "default" for t in trials})
+        model_val = models[0] + ("…" if len(models) > 1 else "")
+        setup_sub = f"effort: {', '.join(efforts)} · {len(trials)} trial(s)"
+        worker_sub = f"{subs} subagents · {judges} judges"
         views.append(
             f"<div id='{vid}' class='detail-view hidden'>"
             f"<button class='crumb-link' onclick='backToEvalOverview()'>← Harness Eval Calls</button>"
@@ -383,9 +389,9 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
             f"</div><span class='badge badge-slate'>{_esc(_cost(total_cost, zero_ok=bool(costs)))}</span></div>"
             f"<div class='kpi-grid'>"
             f"{_kpi('Outcome & score', outcome_value, outcome_sub)}"
-            f"{_kpi('Worker trials', str(worker), f'{subs} subagents')}"
-            f"{_kpi('Judge calls', str(judges), 'semantic')}"
+            f"{_kpi('Worker trials', str(worker), worker_sub)}"
             f"{_kpi('Est. cost', _cost(total_cost, zero_ok=bool(costs)), billed_sub)}"
+            f"{_kpi('Setup', _esc(model_val), setup_sub)}"
             f"</div>"
             f"{_comparison_table(trials)}"
             f"<h4>Trials</h4>"
