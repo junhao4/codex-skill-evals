@@ -996,6 +996,57 @@ def test_summarize_experiment_outcome(tmp_path=None):
     assert out3["outcome"] == "UNKNOWN"
 
 
+def test_cache_invalidated_on_schema_version_mismatch(tmp_path):
+    """TDD: a cache written under an older schema version is not reused."""
+    import json as _json
+
+    from _lib.usage import CACHE_SCHEMA_VERSION, update_rollout_cache
+
+    sessions_root = tmp_path / "sessions"
+    rollout = _write_rollout(
+        sessions_root / "2026" / "04" / "20" / "rollout-x.jsonl",
+        [
+            {
+                "timestamp": "2026-04-20T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-x", "timestamp": "2026-04-20T10:00:00Z",
+                    "cwd": str(tmp_path), "source": "cli",
+                },
+            },
+            {
+                "timestamp": "2026-04-20T10:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "exec_command_end", "command": "echo hi", "exit_code": 0},
+            },
+        ],
+    )
+    cache_path = tmp_path / "cache.json"
+    # Seed a STALE cache: old schema version, and a data blob WITHOUT 'commands'
+    # (as the pre-fix parser produced), matching the file's real mtime/size so
+    # the mtime check alone would happily reuse it.
+    stat = rollout.stat()
+    cache_path.write_text(_json.dumps({
+        "schema_version": CACHE_SCHEMA_VERSION - 1,
+        "updated_at": "old",
+        "files": {
+            str(rollout.resolve()): {
+                "mtime_ns": stat.st_mtime_ns, "size": stat.st_size,
+                "data": {"thread_id": "thread-x", "command_count": 1},  # no 'commands'
+            }
+        },
+    }), encoding="utf-8")
+
+    entries = update_rollout_cache(sessions_root, cache_path)
+    # The stale entry must be discarded and the rollout re-parsed with current code.
+    rec = next(iter(entries.values()))
+    assert "commands" in rec, "schema bump should force a re-parse carrying new fields"
+    assert rec["commands"][0]["command"] == "echo hi"
+    # And the cache file is rewritten at the current version.
+    on_disk = _json.loads(cache_path.read_text())
+    assert on_disk["schema_version"] == CACHE_SCHEMA_VERSION
+
+
 def test_clean_user_prompt_drops_synthetic_app_events(tmp_path=None):
     """TDD: synthetic Codex app/IDE events are not treated as real prompts."""
     from _lib.usage import _clean_user_prompt
@@ -1288,6 +1339,7 @@ class UsageTests(unittest.TestCase):
             test_session_trace_timeline_renders_commands,
             test_eval_trial_view_renders_worker_commands,
             test_clean_user_prompt_drops_synthetic_app_events,
+            test_cache_invalidated_on_schema_version_mismatch,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
