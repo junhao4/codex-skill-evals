@@ -820,6 +820,9 @@ def test_trial_grades_surface_in_summary_and_html(tmp_path):
     assert "Semantic" in html
     assert "DET-CHECK-ALPHA" in html
     assert "SEM-CHECK-BETA" in html
+    # Semantic criterion cards surface the judge's reasoning notes as prose
+    assert "criterion-card" in html
+    assert "good" in html  # the SEM-CHECK-BETA note text
 
 
 def test_derive_experiment_comparison_baseline_vs_with_skill(tmp_path=None):

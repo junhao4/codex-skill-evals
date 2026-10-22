@@ -635,13 +635,26 @@ def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
             jcls = {"pass": "badge-green", "partial": "badge-amber", "fail": "badge-amber"}.get(
                 jv, "badge-slate"
             )
+            criterion_cards = ""
+            for c in j.get("checks") or []:
+                c_pass = c.get("pass")
+                c_cls = "badge-green" if c_pass else "badge-amber"
+                c_badge = "pass" if c_pass else "fail"
+                criterion_cards += (
+                    f"<div class='criterion-card'>"
+                    f"<div class='criterion-head'>"
+                    f"<span class='badge {c_cls}'>{c_badge} · {_esc(c.get('points'))} pts</span> "
+                    f"<code>{_esc(c.get('id'))}</code></div>"
+                    f"<div class='criterion-notes'>{_esc(c.get('notes') or '—')}</div>"
+                    f"</div>"
+                )
+            if not criterion_cards:
+                criterion_cards = "<p class='muted'>No criteria recorded.</p>"
             judge_blocks += (
                 f"<div class='judge-block'><div class='judge-head'>Judge "
                 f"{_esc(j.get('judge'))} <span class='badge {jcls}'>{_esc(jv)}</span> "
                 f"<span class='grade-score'>{_esc(j.get('score'))}/100</span></div>"
-                "<table><thead><tr><th>Check</th><th>Pass</th><th class='num'>Pts</th>"
-                "<th>Notes</th></tr></thead>"
-                f"<tbody>{_grade_check_rows(j.get('checks') or [])}</tbody></table></div>"
+                f"{criterion_cards}</div>"
             )
         grade_section = (
             "<h4>Grading</h4><div class='grade-grid'>"
@@ -1022,6 +1035,10 @@ code { font-family:var(--mono); font-size:11px; background:#eef4fb; border:1px s
   padding:12px; margin-bottom:10px; }
 .judge-head { font-weight:700; font-size:13px; margin-bottom:8px; display:flex; gap:8px;
   align-items:center; }
+.criterion-card { background:#fff; border:1px solid var(--border); border-radius:6px;
+  padding:10px 12px; margin-bottom:8px; }
+.criterion-head { display:flex; gap:8px; align-items:center; font-size:12px; margin-bottom:4px; }
+.criterion-notes { font-size:12px; color:var(--text-muted); line-height:1.5; }
 .note-box { font-size:12px; color:var(--text-muted); background:#eef4fb;
   border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
 """
