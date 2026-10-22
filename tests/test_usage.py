@@ -522,12 +522,33 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
 
     html = render_usage_html(summary)
     assert "<!doctype html>" in html.lower()
-    assert "color-scheme: light;" in html
-    assert "#f6f8fb" in html
+    # Prototype-E interactive two-mode explorer structure
+    assert 'id="mode-real"' in html
+    assert 'id="mode-eval"' in html
+    assert 'id="eval-overview"' in html
+    assert "function switchMode(" in html
+    assert "function openEvalExperiment(" in html
+    assert "function openEvalTrial(" in html
+    assert "Benchmarked Skills" in html
+    assert "Experiment Run History" in html
+    # Content still flows through
     assert "Real Project Work" in html
     assert "Harness Eval Calls" in html
     assert "unused-skill" in html
     assert "security-reviewer" in html
+    # The one evaluated skill (code-review) produces a clickable experiment
+    # drill-down view, wired by a matching onclick target + element id.
+    import re as _re
+
+    called = set(
+        _re.findall(r"openEval(?:Experiment|Trial)\('([^']+)'\)", html)
+    )
+    present = set(
+        _re.findall(r"id='([^']+)' class='detail-view", html)
+    )
+    assert called, "expected at least one eval drill-down onclick target"
+    # Every navigable target must resolve to a generated detail view.
+    assert called <= present, f"unresolved onclick targets: {called - present}"
 
 
 def test_setup_and_usage_cli_end_to_end(tmp_path):
