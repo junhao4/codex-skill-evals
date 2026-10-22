@@ -249,16 +249,46 @@ def _group_eval_by_experiment(
 
 def _eval_skill_rows(harness_evals: dict[str, Any]) -> str:
     rows: list[str] = []
+    # Per-skill latest-experiment outcome, derived from the trial sessions.
+    from _lib.usage import summarize_experiment_outcome
+
+    latest_by_skill: dict[str, dict[str, Any]] = {}
+    sessions_by_skill: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for s in harness_evals.get("sessions", []):
+        sessions_by_skill.setdefault(s["eval_skill"], {}).setdefault(
+            s["experiment"], []
+        ).append(s)
+    for skill, exps in sessions_by_skill.items():
+        latest_exp = sorted(exps)[-1]  # experiments sort lexically; newest last
+        latest_by_skill[skill] = {
+            "experiment": latest_exp,
+            "outcome": summarize_experiment_outcome(exps[latest_exp]),
+        }
+
     for es in harness_evals["by_skill"]:
         wtok, jtok = es["worker_tokens"], es["judge_tokens"]
         exps = " ".join(
             f"<span class='badge badge-slate'>{_esc(e)}</span>" for e in es["experiments"]
         )
+        latest = latest_by_skill.get(es["skill"])
+        if latest:
+            oc = latest["outcome"]
+            ocls = {"PASS": "badge-green", "FAIL": "badge-amber", "UNKNOWN": "badge-slate"}.get(
+                oc["outcome"], "badge-slate"
+            )
+            score_txt = f"{oc['mean_score']}/100" if oc["mean_score"] is not None else "—"
+            outcome_cell = (
+                f"<span class='badge {ocls}'>{_esc(oc['outcome'])}</span> {score_txt}"
+                f"<div class='muted' style='font-size:11px;margin-top:2px;'>{_esc(latest['experiment'])}</div>"
+            )
+        else:
+            outcome_cell = "<span class='muted'>—</span>"
         rows.append(
             f"<tr>"
             f"<td><div class='row-title'>{_esc(es['skill'])}</div>"
             f"<div class='exp-badges'>{exps or '—'}</div></td>"
             f"<td class='num'>{es['experiment_count']}</td>"
+            f"<td>{outcome_cell}</td>"
             f"<td class='num'>{es['worker_trials']} "
             f"<span class='muted'>({es['with_skill_trials']}w/{es['baseline_trials']}b)</span></td>"
             f"<td class='num'>{es['subagent_spawns']}</td>"
@@ -272,7 +302,7 @@ def _eval_skill_rows(harness_evals: dict[str, Any]) -> str:
         )
     if not rows:
         rows.append(
-            "<tr><td colspan='10' class='empty'>No harness eval runs recorded "
+            "<tr><td colspan='11' class='empty'>No harness eval runs recorded "
             "under <code>&lt;skill&gt;/runs/</code>.</td></tr>"
         )
     return "".join(rows)
@@ -718,8 +748,22 @@ def render_usage_html(summary: dict[str, Any]) -> str:
     if eval_sessions:
         e0 = eval_sessions[0]
         e0_vid = _slug("eval-exp", e0["eval_skill"], e0["experiment"])
+        # Outcome of the experiment the banner points at.
+        from _lib.usage import summarize_experiment_outcome as _soutcome
+
+        e0_trials = [
+            s
+            for s in eval_sessions
+            if s["eval_skill"] == e0["eval_skill"] and s["experiment"] == e0["experiment"]
+        ]
+        e0_oc = _soutcome(e0_trials)
+        e0_ocls = {"PASS": "badge-green", "FAIL": "badge-amber", "UNKNOWN": "badge-slate"}.get(
+            e0_oc["outcome"], "badge-slate"
+        )
+        e0_score = f"{e0_oc['mean_score']}/100" if e0_oc["mean_score"] is not None else ""
         eval_banner = _latest_banner(
             "LATEST EVAL",
+            f"<span class='badge {e0_ocls}'>{_esc(e0_oc['outcome'])} {e0_score}</span>"
             f"<span>{_esc(e0['eval_skill'])} / {_esc(e0['experiment'])}</span><span>·</span>"
             f"<span class='mono'>{_esc(_cost(e0['est_cost']))}</span>"
             f"<span>({_esc(e0['configuration'])})</span>",
@@ -837,6 +881,7 @@ def render_usage_html(summary: dict[str, Any]) -> str:
           <div class="card-subtitle">Worker + judge cost per evaluated skill</div>
         </div><span class="badge badge-blue">{len(harness_evals['by_skill'])} skills</span></div>
         <table><thead><tr><th>Evaluated Skill</th><th class="num">Exps</th>
+          <th>Latest Outcome</th>
           <th class="num">Trials</th><th class="num">Subagents</th>
           <th class="num">Judges</th><th class="num">Worker Out</th>
           <th class="num">Judge Out</th><th class="num">Worker Cost</th>

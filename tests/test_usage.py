@@ -993,6 +993,68 @@ def test_summarize_experiment_outcome(tmp_path=None):
     assert out3["outcome"] == "UNKNOWN"
 
 
+def test_benchmarked_skills_table_shows_latest_outcome(tmp_path=None):
+    """TDD: the Benchmarked Skills overview table shows a latest outcome/score."""
+    from _lib.usage_html import render_usage_html
+
+    empty_tok = {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0}
+
+    def _sess(exp, cfg, det):
+        return {
+            "thread_id": f"t-{exp}-{cfg}", "started_at": f"2026-04-20T11:00:0{exp[-1]}Z",
+            "date": "2026-04-20", "cwd": "/x", "eval_skill": "demo-skill",
+            "experiment": exp, "test_case": "case-1", "configuration": cfg, "trial": "trial-01",
+            "model": "gpt-5.4", "reasoning_effort": "high", "turn_count": 1,
+            "command_count": 0, "failed_command_count": 0, "first_prompt": "p",
+            "subagent_spawn_count": 0, "subagents": [], "judge_call_count": 0,
+            "judge_tokens": empty_tok, "judge_est_cost": None,
+            "parent_token_usage": empty_tok, "subagent_token_usage": empty_tok,
+            "worker_tokens": empty_tok, "worker_est_cost": 0.001,
+            "token_usage": empty_tok, "est_cost": 0.001,
+            "grades": {"deterministic": {"score": det, "checks": []}, "semantic": None},
+        }
+
+    # Two experiments; the LATEST (experiment-002) failed (score 40)
+    sessions = [_sess("experiment-001", "with-skill", 100), _sess("experiment-002", "with-skill", 40)]
+    by_skill = [{
+        "skill": "demo-skill", "experiments": ["experiment-001", "experiment-002"],
+        "experiment_count": 2, "worker_trials": 2, "baseline_trials": 0, "with_skill_trials": 2,
+        "subagent_spawns": 0, "judge_calls": 0,
+        "worker_tokens": empty_tok, "judge_tokens": empty_tok, "tokens": empty_tok,
+        "worker_est_cost": 0.002, "judge_est_cost": None, "est_cost": 0.002, "priced_count": 2,
+    }]
+    summary = {
+        "project_name": "demo", "project_root": "/x", "generated_at": "2026-04-20T12:00:00Z",
+        "totals": {
+            "session_count": 0, "turn_count": 0, "command_count": 0, "failed_command_count": 0,
+            "subagent_spawn_count": 0, "cache_hit_pct": 0.0, "parent_tokens": empty_tok,
+            "subagent_tokens": empty_tok, "tokens": empty_tok, "parent_est_cost": None,
+            "subagent_est_cost": None, "est_cost": None, "priced_sessions": 0,
+        },
+        "skills": [], "subagents": [], "models": [], "daily": [], "sessions": [],
+        "harness_evals": {
+            "totals": {
+                "worker_session_count": 2, "subagent_spawn_count": 0, "judge_call_count": 0,
+                "total_call_count": 2, "turn_count": 2, "worker_turn_count": 2, "judge_turn_count": 0,
+                "command_count": 0, "failed_command_count": 0, "cache_hit_pct": 0.0,
+                "worker_tokens": empty_tok, "judge_tokens": empty_tok, "tokens": empty_tok,
+                "worker_est_cost": 0.002, "judge_est_cost": None, "est_cost": 0.002, "priced_calls": 2,
+            },
+            "by_skill": by_skill, "subagents": [], "models": [], "sessions": sessions,
+        },
+        "combined_totals": {"est_cost": 0.002, "tokens": empty_tok, "cache_hit_pct": 0.0},
+    }
+
+    html = render_usage_html(summary)
+    assert "Latest Outcome" in html
+    # The latest experiment (002) failed -> FAIL badge somewhere in the skills table
+    assert "FAIL" in html
+    # The latest-eval spotlight banner shows the pointed-at experiment's outcome
+    assert "LATEST EVAL" in html
+    # banner outcome badge: experiment-001 (sessions[0]) scored 100 -> PASS
+    assert "PASS" in html
+
+
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 
@@ -1010,6 +1072,7 @@ class UsageTests(unittest.TestCase):
             test_derive_experiment_comparison_baseline_vs_with_skill,
             test_experiment_view_renders_baseline_vs_with_skill_table,
             test_summarize_experiment_outcome,
+            test_benchmarked_skills_table_shows_latest_outcome,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
