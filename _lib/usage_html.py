@@ -350,6 +350,30 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
         billed = sum(t["token_usage"]["billed_output_tokens"] for t in trials)
         costs = [t["est_cost"] for t in trials if t["est_cost"] is not None]
         total_cost = round(sum(costs), 6) if costs else None
+        from _lib.usage import summarize_experiment_outcome
+
+        oc = summarize_experiment_outcome(trials)
+        outcome_cls = {
+            "PASS": "badge-green",
+            "FAIL": "badge-amber",
+            "UNKNOWN": "badge-slate",
+        }.get(oc["outcome"], "badge-slate")
+        score_txt = (
+            f"{oc['mean_score']}/100" if oc["mean_score"] is not None else "—"
+        )
+        det_sem = []
+        if oc["mean_det"] is not None:
+            det_sem.append(f"Det {oc['mean_det']}")
+        if oc["mean_sem"] is not None:
+            det_sem.append(f"Sem {oc['mean_sem']}")
+        det_sem_txt = " · ".join(det_sem) or "no grades"
+        outcome_value = (
+            f"<span class='badge {outcome_cls}'>{_esc(oc['outcome'])}</span> {score_txt}"
+        )
+        outcome_sub = (
+            f"{oc['trials_passed']}/{oc['trials_total']} trials passed · {det_sem_txt}"
+        )
+        billed_sub = f"{_num(billed)} billed out"
         views.append(
             f"<div id='{vid}' class='detail-view hidden'>"
             f"<button class='crumb-link' onclick='backToEvalOverview()'>← Harness Eval Calls</button>"
@@ -358,10 +382,10 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
             f"<div class='card-subtitle'>Click a trial to open its trace &amp; grading</div>"
             f"</div><span class='badge badge-slate'>{_esc(_cost(total_cost, zero_ok=bool(costs)))}</span></div>"
             f"<div class='kpi-grid'>"
+            f"{_kpi('Outcome & score', outcome_value, outcome_sub)}"
             f"{_kpi('Worker trials', str(worker), f'{subs} subagents')}"
             f"{_kpi('Judge calls', str(judges), 'semantic')}"
-            f"{_kpi('Billed output', _num(billed), 'tokens')}"
-            f"{_kpi('Est. cost', _cost(total_cost, zero_ok=bool(costs)), 'API-equiv.')}"
+            f"{_kpi('Est. cost', _cost(total_cost, zero_ok=bool(costs)), billed_sub)}"
             f"</div>"
             f"{_comparison_table(trials)}"
             f"<h4>Trials</h4>"

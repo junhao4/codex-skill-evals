@@ -803,6 +803,46 @@ def _axis_verdict_local(old, new, higher_is_better: bool) -> str:
     return "improved" if better else "regressed"
 
 
+def summarize_experiment_outcome(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll up an experiment's outcome + scores from per-trial grades. Pure.
+
+    - mean_score: mean of per-trial headline scores (min(det, sem) when both ran).
+    - mean_det / mean_sem: mean of the respective grader scores where present.
+    - trials_passed / trials_total: headline score >= PASS_THRESHOLD counts.
+    - outcome: "PASS" when every graded trial passed, "FAIL" when at least one
+      graded trial scored below threshold, "UNKNOWN" when no trial was graded.
+    """
+    from _lib.grading import PASS_THRESHOLD
+
+    headlines = [s for s in (_trial_headline_score(t) for t in trials) if s is not None]
+    det_scores: list[float] = []
+    sem_scores: list[float] = []
+    for t in trials:
+        grades = t.get("grades") or {}
+        det = grades.get("deterministic") or {}
+        sem = grades.get("semantic") or {}
+        if isinstance(det.get("score"), (int, float)):
+            det_scores.append(float(det["score"]))
+        if isinstance(sem.get("score"), (int, float)):
+            sem_scores.append(float(sem["score"]))
+
+    if not headlines:
+        outcome = "UNKNOWN"
+    elif all(s >= PASS_THRESHOLD for s in headlines):
+        outcome = "PASS"
+    else:
+        outcome = "FAIL"
+
+    return {
+        "outcome": outcome,
+        "mean_score": _mean(headlines),
+        "mean_det": _mean(det_scores),
+        "mean_sem": _mean(sem_scores),
+        "trials_total": len(headlines),
+        "trials_passed": sum(1 for s in headlines if s >= PASS_THRESHOLD),
+    }
+
+
 def _collect_harness_eval_usage(
     by_tid: dict[str, dict[str, Any]],
     children_by_parent: dict[str, list[str]],

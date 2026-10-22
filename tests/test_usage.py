@@ -944,6 +944,46 @@ def test_experiment_view_renders_baseline_vs_with_skill_table(tmp_path=None):
     # score improved 60 -> 92 (+32), billed output dropped 1000 -> 800 (-200)
     assert "+32" in html
     assert "-200" in html
+    # Outcome KPI card: both trials graded (det 60 baseline, 92 with-skill);
+    # the baseline trial (60) is below threshold 70 -> experiment FAILs, and the
+    # det mean (76) is surfaced.
+    assert "Outcome" in html
+    assert "FAIL" in html
+
+
+def test_summarize_experiment_outcome(tmp_path=None):
+    """TDD: experiment outcome/score rollup from per-trial grades."""
+    from _lib.usage import summarize_experiment_outcome
+
+    def _trial(det, sem):
+        return {
+            "grades": {
+                "deterministic": {"score": det} if det is not None else None,
+                "semantic": {"score": sem} if sem is not None else None,
+            }
+        }
+
+    # Two trials, headline = min(det, sem): (100,90)->90, (80,100)->80; mean 85 -> PASS
+    trials = [_trial(100, 90), _trial(80, 100)]
+    out = summarize_experiment_outcome(trials)
+    assert out["mean_score"] == 85.0
+    assert out["mean_det"] == 90.0  # (100 + 80) / 2
+    assert out["mean_sem"] == 95.0  # (90 + 100) / 2
+    assert out["trials_total"] == 2
+    assert out["trials_passed"] == 2  # both headline scores >= 70
+    assert out["outcome"] == "PASS"
+
+    # A failing trial drags the outcome
+    fail_trials = [_trial(100, 100), _trial(40, 100)]  # headlines 100, 40
+    out2 = summarize_experiment_outcome(fail_trials)
+    assert out2["mean_score"] == 70.0
+    assert out2["trials_passed"] == 1  # only the 100 trial clears 70
+    assert out2["outcome"] == "FAIL"  # one trial below threshold
+
+    # No grades at all -> unknown, no crash
+    out3 = summarize_experiment_outcome([{"grades": {"deterministic": None, "semantic": None}}])
+    assert out3["mean_score"] is None
+    assert out3["outcome"] == "UNKNOWN"
 
 
 import tempfile  # noqa: E402
@@ -962,6 +1002,7 @@ class UsageTests(unittest.TestCase):
             test_trial_grades_surface_in_summary_and_html,
             test_derive_experiment_comparison_baseline_vs_with_skill,
             test_experiment_view_renders_baseline_vs_with_skill_table,
+            test_summarize_experiment_outcome,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
