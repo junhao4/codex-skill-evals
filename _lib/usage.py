@@ -708,6 +708,101 @@ def read_trial_grades(trial_dir: Path) -> dict[str, Any]:
     return {"deterministic": deterministic, "semantic": semantic}
 
 
+def _trial_headline_score(trial: dict[str, Any]) -> float | None:
+    """A trial's headline score = min(det, sem) when both present (harness rule)."""
+    grades = trial.get("grades") or {}
+    det = grades.get("deterministic") or {}
+    sem = grades.get("semantic") or {}
+    scores = [
+        s for s in (det.get("score"), sem.get("score")) if isinstance(s, (int, float))
+    ]
+    return float(min(scores)) if scores else None
+
+
+def _mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def derive_experiment_comparison(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Derive a per-test-case baseline vs with-skill comparison from trial data.
+
+    Pure (no I/O). For each test case, computes the mean headline score, mean
+    billed output tokens, and mean est. cost over its baseline trials and over
+    its with-skill trials, plus signed deltas (with-skill relative to baseline).
+    A config with no trials yields ``None`` for that side and ``"n/a"`` deltas.
+    Score/pass are higher-is-better; tokens and cost are lower-is-better.
+    """
+    from _lib.pricing import format_delta
+
+    by_case: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    order: list[str] = []
+    for t in trials:
+        case = str(t.get("test_case"))
+        cfg = t.get("configuration")
+        if case not in by_case:
+            by_case[case] = {"baseline": [], "with-skill": []}
+            order.append(case)
+        if cfg in by_case[case]:
+            by_case[case][cfg].append(t)
+
+    def _cell(group: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not group:
+            return None
+        scores = [s for s in (_trial_headline_score(t) for t in group) if s is not None]
+        billed = [
+            t["token_usage"]["billed_output_tokens"]
+            for t in group
+            if t.get("token_usage")
+        ]
+        costs = [t["est_cost"] for t in group if t.get("est_cost") is not None]
+        return {
+            "n": len(group),
+            "mean_score": _mean(scores),
+            "mean_billed_output": _mean([float(b) for b in billed]),
+            "mean_cost": round(sum(costs) / len(costs), 6) if costs else None,
+        }
+
+    comparison: list[dict[str, Any]] = []
+    for case in order:
+        base = _cell(by_case[case]["baseline"])
+        skill = _cell(by_case[case]["with-skill"])
+
+        def _delta(key: str, higher_is_better: bool) -> tuple[str, str]:
+            o = base.get(key) if base else None
+            n = skill.get(key) if skill else None
+            if o is None or n is None:
+                return "n/a", "unknown"
+            return format_delta(o, n), _axis_verdict_local(o, n, higher_is_better)
+
+        score_delta, score_verdict = _delta("mean_score", True)
+        billed_delta, billed_verdict = _delta("mean_billed_output", False)
+        cost_delta, cost_verdict = _delta("mean_cost", False)
+        comparison.append(
+            {
+                "test_case": case,
+                "baseline": base,
+                "with_skill": skill,
+                "score_delta": score_delta,
+                "score_verdict": score_verdict,
+                "billed_output_delta": billed_delta,
+                "billed_output_verdict": billed_verdict,
+                "cost_delta": cost_delta,
+                "cost_verdict": cost_verdict,
+            }
+        )
+    return comparison
+
+
+def _axis_verdict_local(old, new, higher_is_better: bool) -> str:
+    """improved / regressed / unchanged for a numeric change. Pure."""
+    if old is None or new is None:
+        return "unknown"
+    if new == old:
+        return "unchanged"
+    better = new > old if higher_is_better else new < old
+    return "improved" if better else "regressed"
+
+
 def _collect_harness_eval_usage(
     by_tid: dict[str, dict[str, Any]],
     children_by_parent: dict[str, list[str]],

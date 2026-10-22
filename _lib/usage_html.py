@@ -363,6 +363,8 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
             f"{_kpi('Billed output', _num(billed), 'tokens')}"
             f"{_kpi('Est. cost', _cost(total_cost, zero_ok=bool(costs)), 'API-equiv.')}"
             f"</div>"
+            f"{_comparison_table(trials)}"
+            f"<h4>Trials</h4>"
             f"<table><thead><tr><th>Test case</th><th>Config</th><th>Trial</th>"
             f"<th>Model</th><th class='num'>Turns</th><th class='num'>Subagents</th>"
             f"<th class='num'>Judges</th><th class='num'>Billed out</th>"
@@ -414,6 +416,65 @@ def _grade_panel(title: str, grade: dict[str, Any] | None, *, extra: str = "") -
         f"<span class='grade-score'>{_esc(grade.get('score'))}/100 "
         f"<span class='badge {vcls}'>{_esc(verdict)}</span></span></div>"
         f"{extra}{body}</div>"
+    )
+
+
+def _verdict_badge(verdict: str) -> str:
+    cls = {
+        "improved": "badge-green",
+        "regressed": "badge-amber",
+        "unchanged": "badge-slate",
+    }.get(verdict, "badge-slate")
+    return f"<span class='badge {cls}'>{_esc(verdict)}</span>"
+
+
+def _cmp_cell(cell: dict[str, Any] | None, key: str, *, cost: bool = False) -> str:
+    if not cell or cell.get(key) is None:
+        return "<span class='muted'>—</span>"
+    val = cell[key]
+    if cost:
+        return _cost(val)
+    if isinstance(val, (int, float)) and float(val).is_integer():
+        return _num(val)
+    return _esc(val)
+
+
+def _comparison_table(trials: list[dict[str, Any]]) -> str:
+    """Render the baseline vs with-skill comparison per test case."""
+    from _lib.usage import derive_experiment_comparison
+
+    comparison = derive_experiment_comparison(trials)
+    if not comparison:
+        return ""
+    rows: list[str] = []
+    for c in comparison:
+        base, skill = c["baseline"], c["with_skill"]
+        rows.append(
+            f"<tr><td rowspan='3'><code>{_esc(c['test_case'])}</code></td>"
+            f"<td>Mean score</td>"
+            f"<td class='num'>{_cmp_cell(base, 'mean_score')}</td>"
+            f"<td class='num'>{_cmp_cell(skill, 'mean_score')}</td>"
+            f"<td class='num'>{_esc(c['score_delta'])}</td>"
+            f"<td>{_verdict_badge(c['score_verdict'])}</td></tr>"
+            f"<tr><td>Billed output</td>"
+            f"<td class='num'>{_cmp_cell(base, 'mean_billed_output')}</td>"
+            f"<td class='num'>{_cmp_cell(skill, 'mean_billed_output')}</td>"
+            f"<td class='num'>{_esc(c['billed_output_delta'])}</td>"
+            f"<td>{_verdict_badge(c['billed_output_verdict'])}</td></tr>"
+            f"<tr><td>Est. cost</td>"
+            f"<td class='num'>{_cmp_cell(base, 'mean_cost', cost=True)}</td>"
+            f"<td class='num'>{_cmp_cell(skill, 'mean_cost', cost=True)}</td>"
+            f"<td class='num'>{_esc(c['cost_delta'])}</td>"
+            f"<td>{_verdict_badge(c['cost_verdict'])}</td></tr>"
+        )
+    return (
+        "<h4>Baseline vs With-Skill</h4>"
+        "<p class='muted grade-meta'>Means over the experiment's trials. Score is "
+        "higher-is-better; billed output and cost are lower-is-better.</p>"
+        "<table><thead><tr><th>Test case</th><th>Axis</th>"
+        "<th class='num'>Baseline</th><th class='num'>With-skill</th>"
+        "<th class='num'>Delta</th><th>Verdict</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
 

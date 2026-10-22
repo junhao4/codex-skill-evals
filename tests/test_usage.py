@@ -822,6 +822,130 @@ def test_trial_grades_surface_in_summary_and_html(tmp_path):
     assert "SEM-CHECK-BETA" in html
 
 
+def test_derive_experiment_comparison_baseline_vs_with_skill(tmp_path=None):
+    """TDD: per-experiment baseline vs with-skill comparison from trial data."""
+    from _lib.usage import derive_experiment_comparison
+
+    def _trial(case, cfg, det_score, sem_score, billed, cost):
+        return {
+            "test_case": case,
+            "configuration": cfg,
+            "token_usage": {"billed_output_tokens": billed},
+            "est_cost": cost,
+            "grades": {
+                "deterministic": {"score": det_score} if det_score is not None else None,
+                "semantic": {"score": sem_score} if sem_score is not None else None,
+            },
+        }
+
+    trials = [
+        # case-1: baseline mean score 60, with-skill mean score 90; fewer tokens too
+        _trial("case-1", "baseline", 60, None, 1000, 0.010),
+        _trial("case-1", "baseline", 60, None, 1000, 0.010),
+        _trial("case-1", "with-skill", 90, None, 800, 0.008),
+        _trial("case-1", "with-skill", 90, None, 800, 0.008),
+        # case-2: only with-skill (no baseline) — headline = min(det, sem) = 70
+        _trial("case-2", "with-skill", 100, 70, 500, 0.005),
+    ]
+
+    comp = derive_experiment_comparison(trials)
+    by_case = {c["test_case"]: c for c in comp}
+    assert set(by_case) == {"case-1", "case-2"}
+
+    c1 = by_case["case-1"]
+    assert c1["baseline"]["mean_score"] == 60
+    assert c1["with_skill"]["mean_score"] == 90
+    assert c1["baseline"]["n"] == 2
+    assert c1["with_skill"]["n"] == 2
+    assert c1["baseline"]["mean_billed_output"] == 1000
+    assert c1["with_skill"]["mean_billed_output"] == 800
+    # Deltas present and signed (score up, tokens down = the win)
+    assert "+30" in c1["score_delta"]
+    assert "-200" in c1["billed_output_delta"]
+    assert c1["score_verdict"] == "improved"
+    assert c1["billed_output_verdict"] == "improved"  # fewer tokens is better
+
+    c2 = by_case["case-2"]
+    assert c2["baseline"] is None  # no baseline trials
+    assert c2["with_skill"]["mean_score"] == 70  # min(det=100, sem=70)
+    assert c2["score_delta"] == "n/a"
+
+
+def test_experiment_view_renders_baseline_vs_with_skill_table(tmp_path=None):
+    """TDD: experiment detail view embeds the baseline vs with-skill comparison."""
+    from _lib.usage_html import render_usage_html
+
+    def _sess(case, cfg, det_score, billed, cost):
+        return {
+            "thread_id": f"t-{case}-{cfg}",
+            "started_at": "2026-04-20T11:00:00Z",
+            "date": "2026-04-20",
+            "cwd": "/x",
+            "eval_skill": "demo-skill",
+            "experiment": "experiment-001",
+            "test_case": case,
+            "configuration": cfg,
+            "trial": "trial-01",
+            "model": "gpt-5.4",
+            "reasoning_effort": "high",
+            "turn_count": 1,
+            "command_count": 0,
+            "failed_command_count": 0,
+            "first_prompt": "do it",
+            "subagent_spawn_count": 0,
+            "subagents": [],
+            "judge_call_count": 0,
+            "judge_tokens": {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0},
+            "judge_est_cost": None,
+            "parent_token_usage": {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": billed, "input_tokens": billed},
+            "subagent_token_usage": {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0},
+            "worker_tokens": {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": billed, "input_tokens": billed},
+            "worker_est_cost": cost,
+            "token_usage": {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": billed, "input_tokens": billed},
+            "est_cost": cost,
+            "grades": {"deterministic": {"score": det_score, "checks": []}, "semantic": None},
+        }
+
+    sessions = [
+        _sess("case-1", "baseline", 60, 1000, 0.010),
+        _sess("case-1", "with-skill", 92, 800, 0.008),
+    ]
+    empty_tok = {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0}
+    summary = {
+        "project_name": "demo",
+        "project_root": "/x",
+        "generated_at": "2026-04-20T12:00:00Z",
+        "totals": {
+            "session_count": 0, "turn_count": 0, "command_count": 0,
+            "failed_command_count": 0, "subagent_spawn_count": 0,
+            "cache_hit_pct": 0.0, "parent_tokens": empty_tok, "subagent_tokens": empty_tok,
+            "tokens": empty_tok, "parent_est_cost": None, "subagent_est_cost": None,
+            "est_cost": None, "priced_sessions": 0,
+        },
+        "skills": [], "subagents": [], "models": [], "daily": [], "sessions": [],
+        "harness_evals": {
+            "totals": {
+                "worker_session_count": 2, "subagent_spawn_count": 0,
+                "judge_call_count": 0, "total_call_count": 2, "turn_count": 2,
+                "worker_turn_count": 2, "judge_turn_count": 0, "command_count": 0,
+                "failed_command_count": 0, "cache_hit_pct": 0.0,
+                "worker_tokens": empty_tok, "judge_tokens": empty_tok, "tokens": empty_tok,
+                "worker_est_cost": 0.018, "judge_est_cost": None, "est_cost": 0.018,
+                "priced_calls": 2,
+            },
+            "by_skill": [], "subagents": [], "models": [], "sessions": sessions,
+        },
+        "combined_totals": {"est_cost": 0.018, "tokens": empty_tok, "cache_hit_pct": 0.0},
+    }
+
+    html = render_usage_html(summary)
+    assert "Baseline vs With-Skill" in html
+    assert "case-1" in html
+    # score improved 60 -> 92 (+32), billed output dropped 1000 -> 800 (-200)
+    assert "+32" in html
+    assert "-200" in html
+
+
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 
@@ -836,6 +960,8 @@ class UsageTests(unittest.TestCase):
             test_setup_and_usage_cli_end_to_end,
             test_read_trial_grades_parses_deterministic_and_semantic,
             test_trial_grades_surface_in_summary_and_html,
+            test_derive_experiment_comparison_baseline_vs_with_skill,
+            test_experiment_view_renders_baseline_vs_with_skill_table,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
