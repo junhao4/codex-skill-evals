@@ -1078,6 +1078,9 @@ def test_session_trace_timeline_renders_commands(tmp_path):
     ]
     assert cmds[0]["exit_code"] == 0
     assert cmds[1]["exit_code"] == 1
+    # Each command carries the originating event timestamp for the timeline.
+    assert cmds[0]["timestamp"] == "2026-04-20T10:00:03Z"
+    assert cmds[1]["timestamp"] == "2026-04-20T10:00:04Z"
 
     entries = update_rollout_cache(sessions_root, evals_root / "_usage" / "cache.json")
     summary = build_project_usage(
@@ -1092,6 +1095,8 @@ def test_session_trace_timeline_renders_commands(tmp_path):
     assert "UNIQUECMD_tests/" in html
     assert "exit 0" in html
     assert "exit 1" in html
+    # Relative timing appears on trace steps (first step is the baseline +0.0s).
+    assert "+0.0s" in html or "10:00:03" in html
 
 
 def test_eval_trial_view_renders_worker_commands(tmp_path=None):

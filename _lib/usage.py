@@ -328,6 +328,9 @@ def parse_session_rollout(rollout: Path) -> dict[str, Any]:
 
             command_item = _extract_command_item(event)
             if command_item is not None:
+                command_item["timestamp"] = event.get("timestamp") or (
+                    event.get("payload") or {}
+                ).get("timestamp")
                 commands.append(command_item)
                 if command_item.get("exit_code") in (None, 0):
                     cmd_str = str(command_item.get("command", ""))
