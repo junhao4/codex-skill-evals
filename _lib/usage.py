@@ -640,6 +640,74 @@ def _traverse_subagent_tree(
     return subagent_records, subagent_tokens, subagent_cost_sum, subagent_cost_known
 
 
+def read_trial_grades(trial_dir: Path) -> dict[str, Any]:
+    """Read a trial's deterministic + semantic grades off disk (READ-ONLY, pure).
+
+    Returns ``{"deterministic": <grade|None>, "semantic": <grade|None>}`` where
+    each grade is a plain dict suitable for rendering. Missing or malformed
+    grade files degrade gracefully to ``None`` (never raises).
+
+    - deterministic: from ``grades/deterministic/result.json`` -> its inner
+      ``result`` ({overall_pass, score, verdict, checks[], limitations}).
+    - semantic: from ``grades/semantic/result.json`` -> consensus ``result``
+      flattened with quorum/deciding/abstaining counts and a trimmed per-judge
+      list (each judge's score, verdict, and checks).
+    """
+    trial_dir = Path(trial_dir)
+    deterministic: dict[str, Any] | None = None
+    semantic: dict[str, Any] | None = None
+
+    det_raw = read_json(trial_dir / "grades" / "deterministic" / "result.json")
+    if isinstance(det_raw, dict):
+        inner = det_raw.get("result")
+        if isinstance(inner, dict):
+            deterministic = {
+                "overall_pass": inner.get("overall_pass"),
+                "score": inner.get("score"),
+                "verdict": inner.get("verdict"),
+                "checks": [c for c in inner.get("checks", []) if isinstance(c, dict)],
+                "limitations": inner.get("limitations", []),
+                "status": det_raw.get("status"),
+            }
+
+    sem_raw = read_json(trial_dir / "grades" / "semantic" / "result.json")
+    if isinstance(sem_raw, dict):
+        inner = sem_raw.get("result")
+        if isinstance(inner, dict):
+            judges: list[dict[str, Any]] = []
+            for j in sem_raw.get("judges", []):
+                if not isinstance(j, dict):
+                    continue
+                j_result = j.get("result") or {}
+                if not isinstance(j_result, dict):
+                    j_result = {}
+                judges.append(
+                    {
+                        "judge": j.get("judge"),
+                        "status": j.get("status"),
+                        "score": j_result.get("score"),
+                        "verdict": j_result.get("verdict"),
+                        "checks": [
+                            c for c in j_result.get("checks", []) if isinstance(c, dict)
+                        ],
+                    }
+                )
+            semantic = {
+                "overall_pass": inner.get("overall_pass"),
+                "score": inner.get("score"),
+                "verdict": inner.get("verdict"),
+                "checks": [c for c in inner.get("checks", []) if isinstance(c, dict)],
+                "limitations": inner.get("limitations", []),
+                "status": sem_raw.get("status"),
+                "quorum": sem_raw.get("quorum"),
+                "deciding_judges": sem_raw.get("deciding_judges"),
+                "abstaining_judges": sem_raw.get("abstaining_judges"),
+                "judges": judges,
+            }
+
+    return {"deterministic": deterministic, "semantic": semantic}
+
+
 def _collect_harness_eval_usage(
     by_tid: dict[str, dict[str, Any]],
     children_by_parent: dict[str, list[str]],
@@ -1007,6 +1075,11 @@ def _collect_harness_eval_usage(
 
         started_str = str(root.get("started_at") or "")
         day_key = started_str[:10] if len(started_str) >= 10 else "unknown"
+        trial_grades = (
+            read_trial_grades(Path(trial_dir_str))
+            if trial_dir_str
+            else {"deterministic": None, "semantic": None}
+        )
         eval_sessions_summary.append(
             {
                 "thread_id": root_tid,
@@ -1035,6 +1108,7 @@ def _collect_harness_eval_usage(
                 "worker_est_cost": trial_worker_cost,
                 "token_usage": trial_total_tokens,
                 "est_cost": trial_total_cost,
+                "grades": trial_grades,
             }
         )
 

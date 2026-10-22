@@ -641,6 +641,187 @@ def test_setup_and_usage_cli_end_to_end(tmp_path):
     assert proc.stdout == ""
 
 
+def test_read_trial_grades_parses_deterministic_and_semantic(tmp_path):
+    """TDD: a pure reader surfaces per-trial deterministic + semantic grades."""
+    from _lib.usage import read_trial_grades
+
+    trial_dir = tmp_path / "skill" / "runs" / "experiment-001" / "trials" / "case-1" / "with-skill" / "trial-01"
+    det = trial_dir / "grades" / "deterministic" / "result.json"
+    det.parent.mkdir(parents=True, exist_ok=True)
+    det.write_text(json.dumps({
+        "status": "completed",
+        "exit_code": 0,
+        "result": {
+            "overall_pass": True,
+            "score": 100,
+            "verdict": "pass",
+            "checks": [
+                {"id": "summary-written", "pass": True, "points": 40, "notes": "SUMMARY.md created"},
+                {"id": "source-unchanged", "pass": True, "points": 20, "notes": "no source changes"},
+            ],
+            "limitations": [],
+        },
+        "errors": [],
+    }), encoding="utf-8")
+    sem = trial_dir / "grades" / "semantic" / "result.json"
+    sem.parent.mkdir(parents=True, exist_ok=True)
+    sem.write_text(json.dumps({
+        "status": "completed",
+        "result": {
+            "overall_pass": True,
+            "verdict": "pass",
+            "score": 95,
+            "checks": [{"id": "semantic-jury", "pass": True, "points": 95, "notes": "consensus 95"}],
+            "limitations": [],
+        },
+        "errors": [],
+        "quorum": 1,
+        "deciding_judges": 1,
+        "abstaining_judges": 0,
+        "judges": [
+            {
+                "judge": 1,
+                "status": "completed",
+                "result": {
+                    "score": 95,
+                    "verdict": "pass",
+                    "checks": [
+                        {"id": "accurate-summary", "pass": True, "points": 65, "notes": "accurate"},
+                        {"id": "scope-respected", "pass": True, "points": 30, "notes": "in scope"},
+                    ],
+                },
+            }
+        ],
+    }), encoding="utf-8")
+
+    grades = read_trial_grades(trial_dir)
+
+    # Deterministic grade surfaced with its checks
+    assert grades["deterministic"] is not None
+    assert grades["deterministic"]["score"] == 100
+    assert grades["deterministic"]["verdict"] == "pass"
+    det_ids = [c["id"] for c in grades["deterministic"]["checks"]]
+    assert det_ids == ["summary-written", "source-unchanged"]
+
+    # Semantic consensus + per-judge detail surfaced
+    assert grades["semantic"] is not None
+    assert grades["semantic"]["score"] == 95
+    assert grades["semantic"]["deciding_judges"] == 1
+    assert grades["semantic"]["abstaining_judges"] == 0
+    assert len(grades["semantic"]["judges"]) == 1
+    judge_checks = grades["semantic"]["judges"][0]["checks"]
+    assert [c["id"] for c in judge_checks] == ["accurate-summary", "scope-respected"]
+
+    # Missing grades degrade gracefully (no crash, None values)
+    empty = read_trial_grades(tmp_path / "does" / "not" / "exist")
+    assert empty["deterministic"] is None
+    assert empty["semantic"] is None
+
+
+def test_trial_grades_surface_in_summary_and_html(tmp_path):
+    """TDD: per-trial grades flow into the eval session entry and render in HTML."""
+    from _lib.usage import (
+        build_project_usage,
+        render_usage_html,
+        update_rollout_cache,
+    )
+
+    project_root, evals_root = _make_project(tmp_path)
+    sessions_root = tmp_path / "sessions"
+
+    trial_dir = (
+        evals_root
+        / "code-review"
+        / "runs"
+        / "experiment-001"
+        / "trials"
+        / "case-1"
+        / "with-skill"
+        / "trial-01"
+    )
+    trial_ws = trial_dir / "workspace"
+    _write_rollout(
+        sessions_root / "2026" / "04" / "20" / "rollout-eval-trial.jsonl",
+        [
+            {
+                "timestamp": "2026-04-20T11:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-eval-trial",
+                    "timestamp": "2026-04-20T11:00:00Z",
+                    "cwd": str(trial_ws),
+                    "source": "exec",
+                },
+            },
+            {
+                "timestamp": "2026-04-20T11:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": str(trial_ws), "model": "gpt-5.4", "effort": "high"},
+            },
+            {
+                "timestamp": "2026-04-20T11:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 9000,
+                            "cached_input_tokens": 1000,
+                            "output_tokens": 900,
+                        }
+                    },
+                },
+            },
+        ],
+    )
+    det = trial_dir / "grades" / "deterministic" / "result.json"
+    det.parent.mkdir(parents=True, exist_ok=True)
+    det.write_text(json.dumps({
+        "status": "completed",
+        "result": {
+            "overall_pass": True, "score": 100, "verdict": "pass",
+            "checks": [{"id": "DET-CHECK-ALPHA", "pass": True, "points": 100, "notes": "ok"}],
+            "limitations": [],
+        },
+        "errors": [],
+    }), encoding="utf-8")
+    sem = trial_dir / "grades" / "semantic" / "result.json"
+    sem.parent.mkdir(parents=True, exist_ok=True)
+    sem.write_text(json.dumps({
+        "status": "completed",
+        "result": {
+            "overall_pass": True, "score": 88, "verdict": "pass",
+            "checks": [{"id": "semantic-jury", "pass": True, "points": 88, "notes": "consensus 88"}],
+            "limitations": [],
+        },
+        "errors": [], "quorum": 1, "deciding_judges": 1, "abstaining_judges": 0,
+        "judges": [{
+            "judge": 1, "status": "completed",
+            "result": {"score": 88, "verdict": "pass",
+                       "checks": [{"id": "SEM-CHECK-BETA", "pass": True, "points": 88, "notes": "good"}]},
+        }],
+    }), encoding="utf-8")
+
+    entries = update_rollout_cache(sessions_root, evals_root / "_usage" / "cache.json")
+    summary = build_project_usage(
+        rollouts_by_path=entries, project_root=project_root, evals_root=evals_root
+    )
+
+    sessions = summary["harness_evals"]["sessions"]
+    assert len(sessions) == 1
+    grades = sessions[0]["grades"]
+    assert grades["deterministic"]["score"] == 100
+    assert grades["semantic"]["score"] == 88
+    assert grades["semantic"]["judges"][0]["checks"][0]["id"] == "SEM-CHECK-BETA"
+
+    # The trial-trace detail view must render the grade check ids + scores
+    html = render_usage_html(summary)
+    assert "Deterministic" in html
+    assert "Semantic" in html
+    assert "DET-CHECK-ALPHA" in html
+    assert "SEM-CHECK-BETA" in html
+
+
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 
@@ -653,6 +834,8 @@ class UsageTests(unittest.TestCase):
             test_parse_session_rollout_extracts_skills_tokens_and_subagents,
             test_build_project_usage_scopes_sessions_and_rolls_up_subagents,
             test_setup_and_usage_cli_end_to_end,
+            test_read_trial_grades_parses_deterministic_and_semantic,
+            test_trial_grades_surface_in_summary_and_html,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))

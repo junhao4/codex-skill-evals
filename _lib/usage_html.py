@@ -373,6 +373,50 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
     return "".join(views)
 
 
+def _grade_check_rows(checks: list[dict[str, Any]]) -> str:
+    rows: list[str] = []
+    for c in checks:
+        passed = c.get("pass")
+        badge = (
+            "<span class='badge badge-green'>pass</span>"
+            if passed
+            else "<span class='badge badge-amber'>fail</span>"
+        )
+        rows.append(
+            f"<tr><td><code>{_esc(c.get('id'))}</code></td>"
+            f"<td>{badge}</td>"
+            f"<td class='num'>{_esc(c.get('points'))}</td>"
+            f"<td class='notes-cell'>{_esc(c.get('notes') or '')}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def _grade_panel(title: str, grade: dict[str, Any] | None, *, extra: str = "") -> str:
+    if not grade:
+        return (
+            f"<div class='grade-panel'><div class='grade-panel-head'>{_esc(title)}"
+            f"</div><p class='muted'>Not graded.</p></div>"
+        )
+    verdict = grade.get("verdict") or ("pass" if grade.get("overall_pass") else "—")
+    vcls = {"pass": "badge-green", "partial": "badge-amber", "fail": "badge-amber"}.get(
+        verdict, "badge-slate"
+    )
+    checks = grade.get("checks") or []
+    body = (
+        "<table><thead><tr><th>Check</th><th>Pass</th><th class='num'>Pts</th>"
+        "<th>Notes</th></tr></thead>"
+        f"<tbody>{_grade_check_rows(checks)}</tbody></table>"
+        if checks
+        else "<p class='muted'>No checks recorded.</p>"
+    )
+    return (
+        f"<div class='grade-panel'><div class='grade-panel-head'>{_esc(title)}"
+        f"<span class='grade-score'>{_esc(grade.get('score'))}/100 "
+        f"<span class='badge {vcls}'>{_esc(verdict)}</span></span></div>"
+        f"{extra}{body}</div>"
+    )
+
+
 def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
     views: list[str] = []
     for t in harness_evals["sessions"]:
@@ -445,6 +489,45 @@ def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
 
         cfg = t["configuration"]
         cfg_cls = {"with-skill": "badge-green", "baseline": "badge-blue"}.get(cfg, "badge-slate")
+
+        # Grading: deterministic + semantic side-by-side (prototype-E design)
+        grades = t.get("grades") or {"deterministic": None, "semantic": None}
+        sem = grades.get("semantic")
+        sem_extra = ""
+        if sem:
+            dj = sem.get("deciding_judges")
+            ab = sem.get("abstaining_judges")
+            if dj is not None:
+                ab_txt = f", {ab} abstaining" if ab else ""
+                quorum_val = sem.get("quorum")
+                quorum_txt = f", quorum {quorum_val}" if quorum_val is not None else ""
+                sem_extra = (
+                    f"<p class='muted grade-meta'>{dj} deciding judge(s)"
+                    f"{ab_txt}{quorum_txt}</p>"
+                )
+        judge_blocks = ""
+        for j in (sem or {}).get("judges", []):
+            jv = j.get("verdict") or "—"
+            jcls = {"pass": "badge-green", "partial": "badge-amber", "fail": "badge-amber"}.get(
+                jv, "badge-slate"
+            )
+            judge_blocks += (
+                f"<div class='judge-block'><div class='judge-head'>Judge "
+                f"{_esc(j.get('judge'))} <span class='badge {jcls}'>{_esc(jv)}</span> "
+                f"<span class='grade-score'>{_esc(j.get('score'))}/100</span></div>"
+                "<table><thead><tr><th>Check</th><th>Pass</th><th class='num'>Pts</th>"
+                "<th>Notes</th></tr></thead>"
+                f"<tbody>{_grade_check_rows(j.get('checks') or [])}</tbody></table></div>"
+            )
+        grade_section = (
+            "<h4>Grading</h4><div class='grade-grid'>"
+            f"{_grade_panel('Deterministic', grades.get('deterministic'))}"
+            f"{_grade_panel('Semantic (consensus)', sem, extra=sem_extra)}"
+            "</div>"
+        )
+        if judge_blocks:
+            grade_section += f"<h4>Per-judge detail</h4>{judge_blocks}"
+
         views.append(
             f"<div id='{vid}' class='detail-view hidden'>"
             f"<button class='crumb-link' onclick=\"openEvalExperiment('{exp_vid}')\">"
@@ -461,6 +544,7 @@ def _eval_trial_details(harness_evals: dict[str, Any]) -> str:
             f"{_kpi('Judge billed', _num(jtok['billed_output_tokens']), 'tokens')}"
             f"{_kpi('Trial total', _num(tok['billed_output_tokens']), _cost(t['est_cost']))}"
             f"</div>"
+            f"{grade_section}"
             f"<h4>Trial trace</h4><div class='trace-timeline'>{trace_html}</div>"
             f"<h4>Subagents ({t['subagent_spawn_count']})</h4>{sub_table}"
             f"</div></div>"
@@ -783,6 +867,18 @@ code { font-family:var(--mono); font-size:11px; background:#eef4fb; border:1px s
   margin-top:3px; flex-shrink:0; z-index:1; }
 .trace-step-title { font-weight:700; font-size:13px; }
 .trace-step-body { font-size:12px; color:var(--text-muted); margin-top:2px; }
+.grade-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+@media (max-width:860px){ .grade-grid{ grid-template-columns:1fr; } }
+.grade-panel { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:12px; }
+.grade-panel-head { display:flex; justify-content:space-between; align-items:center;
+  font-weight:700; font-size:13px; margin-bottom:8px; }
+.grade-score { font-family:var(--mono); font-weight:600; font-size:12px; }
+.grade-meta { margin:0 0 8px; font-size:11px; }
+.notes-cell { font-size:11px; color:var(--text-muted); }
+.judge-block { background:#f8fafc; border:1px solid var(--border); border-radius:8px;
+  padding:12px; margin-bottom:10px; }
+.judge-head { font-weight:700; font-size:13px; margin-bottom:8px; display:flex; gap:8px;
+  align-items:center; }
 .note-box { font-size:12px; color:var(--text-muted); background:#eef4fb;
   border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
 """
