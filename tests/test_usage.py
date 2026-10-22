@@ -996,6 +996,59 @@ def test_summarize_experiment_outcome(tmp_path=None):
     assert out3["outcome"] == "UNKNOWN"
 
 
+def test_skill_detail_view_lists_sessions(tmp_path=None):
+    """TDD: each triggered skill has its own detail view listing its sessions."""
+    from _lib.usage_html import render_usage_html
+
+    empty_tok = {"uncached_input_tokens": 0, "cached_input_tokens": 0, "billed_output_tokens": 0, "input_tokens": 0}
+    session = {
+        "thread_id": "thread-abc123def456", "started_at": "2026-04-20T10:00:00Z",
+        "date": "2026-04-20", "cwd": "/x", "model": "gpt-5.4", "reasoning_effort": "high",
+        "turn_count": 2, "command_count": 3, "failed_command_count": 0,
+        "first_prompt": "UNIQUEPROMPTMARKER run the reviewer", "skills_used": ["code-review"],
+        "skill_invocations": {"code-review": "explicit"}, "subagent_spawn_count": 0,
+        "subagents": [], "parent_token_usage": empty_tok, "subagent_token_usage": empty_tok,
+        "token_usage": {"uncached_input_tokens": 100, "cached_input_tokens": 0, "billed_output_tokens": 50, "input_tokens": 100},
+        "est_cost": 0.001,
+    }
+    skills = [{
+        "skill": "code-review", "installed": True, "sessions_triggered": 1,
+        "explicit_count": 1, "implicit_count": 0, "tokens": empty_tok,
+        "est_cost": 0.001, "priced_count": 1,
+    }]
+    summary = {
+        "project_name": "demo", "project_root": "/x", "generated_at": "2026-04-20T12:00:00Z",
+        "totals": {
+            "session_count": 1, "turn_count": 2, "command_count": 3, "failed_command_count": 0,
+            "subagent_spawn_count": 0, "cache_hit_pct": 0.0, "parent_tokens": empty_tok,
+            "subagent_tokens": empty_tok, "tokens": empty_tok, "parent_est_cost": 0.001,
+            "subagent_est_cost": None, "est_cost": 0.001, "priced_sessions": 1,
+        },
+        "skills": skills, "subagents": [], "models": [], "daily": [], "sessions": [session],
+        "harness_evals": {
+            "totals": {
+                "worker_session_count": 0, "subagent_spawn_count": 0, "judge_call_count": 0,
+                "total_call_count": 0, "turn_count": 0, "worker_turn_count": 0, "judge_turn_count": 0,
+                "command_count": 0, "failed_command_count": 0, "cache_hit_pct": 0.0,
+                "worker_tokens": empty_tok, "judge_tokens": empty_tok, "tokens": empty_tok,
+                "worker_est_cost": None, "judge_est_cost": None, "est_cost": None, "priced_calls": 0,
+            },
+            "by_skill": [], "subagents": [], "models": [], "sessions": [],
+        },
+        "combined_totals": {"est_cost": 0.001, "tokens": empty_tok, "cache_hit_pct": 0.0},
+    }
+
+    html = render_usage_html(summary)
+    import re
+    # A per-skill detail view exists, wired by a matching onclick id.
+    called = set(re.findall(r"openSkillDetail\('([^']+)'\)", html))
+    present = set(re.findall(r"id='([^']+)' class='detail-view", html))
+    assert called, "expected a skill drill-down onclick target"
+    assert called <= present, f"unresolved skill onclick targets: {called - present}"
+    # The skill's session (its prompt) appears inside a skill detail view.
+    assert "UNIQUEPROMPTMARKER" in html
+
+
 def test_benchmarked_skills_table_shows_latest_outcome(tmp_path=None):
     """TDD: the Benchmarked Skills overview table shows a latest outcome/score."""
     from _lib.usage_html import render_usage_html
@@ -1076,6 +1129,7 @@ class UsageTests(unittest.TestCase):
             test_experiment_view_renders_baseline_vs_with_skill_table,
             test_summarize_experiment_outcome,
             test_benchmarked_skills_table_shows_latest_outcome,
+            test_skill_detail_view_lists_sessions,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))

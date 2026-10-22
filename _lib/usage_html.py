@@ -71,7 +71,7 @@ def _real_skill_rows(summary: dict[str, Any]) -> str:
         )
         clickable = "clickable-row" if triggered > 0 else ""
         onclick = (
-            f"onclick=\"openSkillDetail('{_esc(sk['skill'])}')\""
+            f"onclick=\"openSkillDetail('{_slug('real-skill', sk['skill'])}')\""
             if triggered > 0
             else ""
         )
@@ -219,18 +219,60 @@ def _real_session_details(summary: dict[str, Any]) -> str:
 
 
 def _real_skill_details(summary: dict[str, Any]) -> str:
-    """A single reusable skill-detail shell populated client-side by name."""
-    return (
-        "<div id='real-skill-detail' class='detail-view hidden'>"
-        "<button class='crumb-link' onclick='backToRealOverview()'>← Real Project Work</button>"
-        "<div class='card'><div class='card-header'><div>"
-        "<div class='card-title'>Skill: <span id='skill-detail-name'>—</span></div>"
-        "<div class='card-subtitle'>Sessions that triggered this skill (see "
-        "Session History below for full traces)</div></div></div>"
-        "<p class='muted'>Use the Session History table on the overview to open "
-        "any individual session's trace. Per-skill token and cost totals are in "
-        "the Cost &amp; Health by Skill table.</p></div></div>"
-    )
+    """One detail view per triggered skill, listing the sessions that used it."""
+    views: list[str] = []
+    sessions = summary["sessions"]
+    for sk in summary["skills"]:
+        if sk["sessions_triggered"] <= 0:
+            continue
+        name = sk["skill"]
+        vid = _slug("real-skill", name)
+        tok = sk["tokens"]
+        rows: list[str] = []
+        for idx, sess in enumerate(sessions):
+            if name not in sess.get("skills_used", []):
+                continue
+            mode = (sess.get("skill_invocations") or {}).get(name, "")
+            mode_badge = (
+                f"<span class='badge badge-blue'>{_esc(mode)}</span>" if mode else ""
+            )
+            rows.append(
+                f"<tr class='clickable-row' onclick=\"openSessionDetail('real-sess-{idx}')\">"
+                f"<td><code>{_esc(_ts(sess['started_at']))}</code></td>"
+                f"<td><code>{_esc(str(sess['thread_id'])[:12])}</code></td>"
+                f"<td>{mode_badge}</td>"
+                f"<td class='num'>{sess['turn_count']}</td>"
+                f"<td class='num'>{_num(sess['token_usage']['billed_output_tokens'])}</td>"
+                f"<td class='num'>{_esc(_cost(sess['est_cost']))}</td>"
+                f"<td class='prompt-cell' title='{_esc(sess['first_prompt'])}'>"
+                f"{_esc(sess['first_prompt'] or '—')}</td></tr>"
+            )
+        body = (
+            "<table><thead><tr><th>Started (UTC)</th><th>Thread</th><th>Mode</th>"
+            "<th class='num'>Turns</th><th class='num'>Billed Out</th>"
+            "<th class='num'>Est. Cost</th><th>First Prompt</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+            if rows
+            else "<p class='muted'>No sessions recorded for this skill.</p>"
+        )
+        cost_cell = _cost(sk["est_cost"]) if sk["priced_count"] > 0 else "n/a"
+        trig_sub = f"{sk['explicit_count']} explicit · {sk['implicit_count']} implicit"
+        views.append(
+            f"<div id='{vid}' class='detail-view hidden'>"
+            f"<button class='crumb-link' onclick='backToRealOverview()'>← Real Project Work</button>"
+            f"<div class='card'><div class='card-header'><div>"
+            f"<div class='card-title'>Skill: <code>{_esc(name)}</code></div>"
+            f"<div class='card-subtitle'>Sessions that triggered this skill — "
+            f"click a row for its full trace</div></div>"
+            f"<span class='badge badge-slate'>{_esc(cost_cell)}</span></div>"
+            f"<div class='kpi-grid'>"
+            f"{_kpi('Sessions triggered', str(sk['sessions_triggered']), trig_sub)}"
+            f"{_kpi('Billed output', _num(tok['billed_output_tokens']), 'tokens')}"
+            f"{_kpi('Uncached input', _num(tok['uncached_input_tokens']), 'tokens')}"
+            f"{_kpi('Est. cost', cost_cell, 'API-equiv.')}"
+            f"</div>{body}</div></div>"
+        )
+    return "".join(views)
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,15 +1103,11 @@ function backToRealOverview() {
   document.getElementById('real-overview').classList.remove('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-function openSkillDetail(skillName) {
+function openSkillDetail(id) {
   document.getElementById('real-overview').classList.add('hidden');
   _hideAll('#mode-real .detail-view');
-  var el = document.getElementById('real-skill-detail');
-  if (el) {
-    el.classList.remove('hidden');
-    var nm = document.getElementById('skill-detail-name');
-    if (nm) nm.textContent = skillName;
-  }
+  var el = document.getElementById(id);
+  if (el) el.classList.remove('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 function openSessionDetail(id) {
