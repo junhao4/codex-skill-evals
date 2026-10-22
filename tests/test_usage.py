@@ -996,6 +996,87 @@ def test_summarize_experiment_outcome(tmp_path=None):
     assert out3["outcome"] == "UNKNOWN"
 
 
+def test_session_trace_timeline_renders_commands(tmp_path):
+    """TDD: real-session detail view shows an execution trace of commands."""
+    from _lib.usage import (
+        build_project_usage,
+        parse_session_rollout,
+        render_usage_html,
+        update_rollout_cache,
+    )
+
+    project_root, evals_root = _make_project(tmp_path)
+    sessions_root = tmp_path / "sessions"
+    _write_rollout(
+        sessions_root / "2026" / "04" / "20" / "rollout-trace.jsonl",
+        [
+            {
+                "timestamp": "2026-04-20T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-trace", "timestamp": "2026-04-20T10:00:00Z",
+                    "cwd": str(project_root), "source": "cli",
+                },
+            },
+            {
+                "timestamp": "2026-04-20T10:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": str(project_root), "model": "gpt-5.4", "effort": "high"},
+            },
+            {
+                "timestamp": "2026-04-20T10:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "do the thing"},
+            },
+            {
+                "timestamp": "2026-04-20T10:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "command": "cat UNIQUECMD_README.md",
+                    "exit_code": 0,
+                },
+            },
+            {
+                "timestamp": "2026-04-20T10:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "command": "pytest UNIQUECMD_tests/",
+                    "exit_code": 1,
+                },
+            },
+        ],
+    )
+
+    # The parsed rollout should retain the ordered command list.
+    parsed = parse_session_rollout(
+        sessions_root / "2026" / "04" / "20" / "rollout-trace.jsonl"
+    )
+    assert "commands" in parsed
+    cmds = parsed["commands"]
+    assert [c["command"] for c in cmds] == [
+        "cat UNIQUECMD_README.md",
+        "pytest UNIQUECMD_tests/",
+    ]
+    assert cmds[0]["exit_code"] == 0
+    assert cmds[1]["exit_code"] == 1
+
+    entries = update_rollout_cache(sessions_root, evals_root / "_usage" / "cache.json")
+    summary = build_project_usage(
+        rollouts_by_path=entries, project_root=project_root, evals_root=evals_root
+    )
+    assert summary["sessions"][0]["commands"][0]["command"] == "cat UNIQUECMD_README.md"
+
+    html = render_usage_html(summary)
+    # Execution trace timeline shows the command text + exit-code outcome
+    assert "Execution Trace" in html
+    assert "UNIQUECMD_README.md" in html
+    assert "UNIQUECMD_tests/" in html
+    assert "exit 0" in html
+    assert "exit 1" in html
+
+
 def test_skill_detail_view_lists_sessions(tmp_path=None):
     """TDD: each triggered skill has its own detail view listing its sessions."""
     from _lib.usage_html import render_usage_html
@@ -1130,6 +1211,7 @@ class UsageTests(unittest.TestCase):
             test_summarize_experiment_outcome,
             test_benchmarked_skills_table_shows_latest_outcome,
             test_skill_detail_view_lists_sessions,
+            test_session_trace_timeline_renders_commands,
         ):
             with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))

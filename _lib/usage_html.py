@@ -167,6 +167,29 @@ def _real_session_rows(summary: dict[str, Any]) -> str:
     return "".join(rows)
 
 
+def _command_timeline(commands: list[dict[str, Any]]) -> str:
+    """Render an ordered command execution trace (command text + exit outcome)."""
+    if not commands:
+        return "<p class='muted'>No commands recorded in this session's trace.</p>"
+    steps: list[str] = []
+    for c in commands:
+        exit_code = c.get("exit_code")
+        ok = exit_code == 0 or (exit_code is None and c.get("status") == "completed")
+        badge_cls = "badge-green" if ok else "badge-amber"
+        if exit_code is None:
+            badge = c.get("status") or "done"
+        else:
+            badge = f"exit {exit_code}"
+        cmd_text = _esc(c.get("command") or "—")
+        steps.append(
+            f"<div class='trace-step'><div class='trace-dot'></div>"
+            f"<div style='flex:1'><div class='trace-step-title'>"
+            f"<span class='badge {badge_cls}'>{_esc(badge)}</span></div>"
+            f"<div class='trace-code'>{cmd_text}</div></div></div>"
+        )
+    return f"<div class='trace-timeline'>{''.join(steps)}</div>"
+
+
 def _real_session_details(summary: dict[str, Any]) -> str:
     views: list[str] = []
     for idx, sess in enumerate(summary["sessions"]):
@@ -212,6 +235,8 @@ def _real_session_details(summary: dict[str, Any]) -> str:
             f"{_kpi('Turns', str(sess['turn_count']), turns_sub)}"
             f"</div>"
             f"<h4>First prompt</h4><div class='trace-block'>{_esc(sess['first_prompt'] or '—')}</div>"
+            f"<h4>Execution Trace ({sess['command_count']} commands)</h4>"
+            f"{_command_timeline(sess.get('commands') or [])}"
             f"<h4>Subagents ({sess['subagent_spawn_count']})</h4>{sub_table}"
             f"</div></div>"
         )
@@ -1065,6 +1090,9 @@ code { font-family:var(--mono); font-size:11px; background:#eef4fb; border:1px s
   margin-top:3px; flex-shrink:0; z-index:1; }
 .trace-step-title { font-weight:700; font-size:13px; }
 .trace-step-body { font-size:12px; color:var(--text-muted); margin-top:2px; }
+.trace-code { font-family:var(--mono); font-size:11px; background:#f1f5f9; border:1px solid var(--border);
+  border-radius:4px; padding:4px 8px; margin-top:4px; white-space:pre-wrap; word-break:break-all;
+  color:#1e293b; }
 .grade-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
 @media (max-width:860px){ .grade-grid{ grid-template-columns:1fr; } }
 .grade-panel { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:12px; }
