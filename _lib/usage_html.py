@@ -386,7 +386,10 @@ def _eval_experiment_details(harness_evals: dict[str, Any]) -> str:
             f"<div class='card'><div class='card-header'><div>"
             f"<div class='card-title'>{_esc(skill)} / {_esc(exp)}</div>"
             f"<div class='card-subtitle'>Click a trial to open its trace &amp; grading</div>"
-            f"</div><span class='badge badge-slate'>{_esc(_cost(total_cost, zero_ok=bool(costs)))}</span></div>"
+            f"</div><div class='card-head-actions'>"
+            f"<a class='btn-link' href='../{_esc(skill)}/runs/{_esc(exp)}/report.md' target='_blank' rel='noopener'>Open raw report.md ↗</a>"
+            f"<span class='badge badge-slate'>{_esc(_cost(total_cost, zero_ok=bool(costs)))}</span>"
+            f"</div></div>"
             f"<div class='kpi-grid'>"
             f"{_kpi('Outcome & score', outcome_value, outcome_sub)}"
             f"{_kpi('Worker trials', str(worker), worker_sub)}"
@@ -919,6 +922,10 @@ body { margin:0; background:var(--bg); color:var(--text); line-height:1.5; }
   gap:12px; margin-bottom:10px; flex-wrap:wrap; }
 .card-title { font-weight:700; font-size:15px; }
 .card-subtitle { font-size:12px; color:var(--text-muted); margin-top:2px; }
+.card-head-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.btn-link { font-size:12px; font-weight:600; color:var(--primary); text-decoration:none;
+  border:1px solid #bfdbfe; border-radius:6px; padding:4px 8px; background:#eef4fb; }
+.btn-link:hover { background:#dbeafe; }
 table { width:100%; border-collapse:collapse; font-size:12px; }
 th,td { border-bottom:1px solid #eef1f6; padding:8px 10px; text-align:left; vertical-align:top; }
 th { font-size:10px; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-muted);

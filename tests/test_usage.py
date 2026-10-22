@@ -953,6 +953,9 @@ def test_experiment_view_renders_baseline_vs_with_skill_table(tmp_path=None):
     assert "Setup" in html
     assert "gpt-5.4" in html
     assert "high" in html
+    # "Open raw report.md" link points at the experiment's report on disk
+    assert "report.md" in html
+    assert "../demo-skill/runs/experiment-001/report.md" in html
 
 
 def test_summarize_experiment_outcome(tmp_path=None):
