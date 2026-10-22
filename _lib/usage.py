@@ -84,6 +84,45 @@ def is_eval_run_cwd(cwd: str | Path | None, evals_root: Path) -> bool:
     return "runs" in parts or "_usage" in parts
 
 
+def parse_eval_run_cwd(
+    cwd: str | Path | None, evals_root: Path
+) -> dict[str, Any] | None:
+    """Extract skill, experiment, test_case, configuration, and trial from an eval trial `cwd`."""
+    if not cwd:
+        return None
+    cwd_path = Path(cwd)
+    try:
+        rel = cwd_path.resolve().relative_to(evals_root.resolve())
+    except ValueError:
+        return None
+    parts = rel.parts
+    if "runs" not in parts:
+        return None
+    runs_idx = parts.index("runs")
+    eval_skill = parts[0] if runs_idx >= 1 else "unknown"
+    experiment = parts[runs_idx + 1] if len(parts) > runs_idx + 1 else "unknown"
+    test_case = "unknown"
+    configuration = "unknown"
+    trial = "unknown"
+    trial_dir: Path | None = None
+    if len(parts) > runs_idx + 2 and parts[runs_idx + 2] == "trials":
+        if len(parts) > runs_idx + 3:
+            test_case = parts[runs_idx + 3]
+        if len(parts) > runs_idx + 4:
+            configuration = parts[runs_idx + 4]
+        if len(parts) > runs_idx + 5:
+            trial = parts[runs_idx + 5]
+            trial_dir = evals_root.resolve().joinpath(*parts[: runs_idx + 6])
+    return {
+        "eval_skill": eval_skill,
+        "experiment": experiment,
+        "test_case": test_case,
+        "configuration": configuration,
+        "trial": trial,
+        "trial_dir": str(trial_dir) if trial_dir is not None else None,
+    }
+
+
 def is_project_work_cwd(
     cwd: str | Path | None, project_root: Path, evals_root: Path
 ) -> bool:
@@ -418,6 +457,8 @@ def update_rollout_cache(
     """Incrementally scan `sessions_root` and update `cache_path`.
 
     Only parses rollout files whose `(mtime_ns, size)` changed since the last scan.
+    If `sessions_root` is not accessible (e.g. inside a restricted sandbox),
+    preserves existing cached rollout entries rather than wiping `cache_path`.
     Returns a map of `rollout_path_str -> parsed_session_dict`.
     """
     existing = read_json(cache_path)
@@ -454,6 +495,8 @@ def update_rollout_cache(
                     "size": stat.st_size,
                     "data": parsed,
                 }
+    elif cached_files:
+        updated_files = dict(cached_files)
 
     write_json(
         cache_path,
@@ -463,7 +506,11 @@ def update_rollout_cache(
             "files": updated_files,
         },
     )
-    return {key: entry["data"] for key, entry in updated_files.items()}
+    return {
+        key: entry["data"]
+        for key, entry in updated_files.items()
+        if isinstance(entry, dict) and isinstance(entry.get("data"), dict)
+    }
 
 
 def discover_project_inventory(
@@ -510,12 +557,624 @@ def _add_token_dicts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     )
 
 
+def _traverse_subagent_tree(
+    root: dict[str, Any],
+    root_tid: str,
+    by_tid: dict[str, dict[str, Any]],
+    children_by_parent: dict[str, list[str]],
+) -> tuple[list[dict[str, Any]], dict[str, int], float, bool]:
+    """Traverse all descendant subagent sessions spawned by `root_tid`."""
+    subagent_records: list[dict[str, Any]] = []
+    subagent_tokens = _empty_token_usage()
+    subagent_cost_sum = 0.0
+    subagent_cost_known = False
+
+    stub_by_tid = {
+        s.get("thread_id"): s
+        for s in root.get("subagents", [])
+        if isinstance(s, dict) and isinstance(s.get("thread_id"), str)
+    }
+    queue = list(children_by_parent.get(root_tid, []))
+    visited = {root_tid}
+
+    while queue:
+        child_tid = queue.pop(0)
+        if child_tid in visited:
+            continue
+        visited.add(child_tid)
+        child = by_tid.get(child_tid)
+        stub = stub_by_tid.get(child_tid, {})
+        if child is not None:
+            c_tokens = dict(child.get("token_usage") or _empty_token_usage())
+            c_model = child.get("model") or root.get("model")
+            c_cost = estimate_api_cost(c_tokens, c_model)
+            c_role = (
+                child.get("agent_role")
+                or stub.get("agent_role")
+                or "default"
+            )
+            c_cmd = int(child.get("command_count", 0) or 0)
+            c_fail = int(child.get("failed_command_count", 0) or 0)
+            subagent_tokens = _add_token_dicts(subagent_tokens, c_tokens)
+            if c_cost is not None:
+                subagent_cost_sum += c_cost
+                subagent_cost_known = True
+            subagent_records.append(
+                {
+                    "thread_id": child_tid,
+                    "agent_role": c_role,
+                    "agent_nickname": child.get("agent_nickname"),
+                    "depth": child.get("depth") or 1,
+                    "model": c_model,
+                    "reasoning_effort": child.get("reasoning_effort"),
+                    "command_count": c_cmd,
+                    "failed_command_count": c_fail,
+                    "token_usage": c_tokens,
+                    "est_cost": c_cost,
+                }
+            )
+            for nested_stub in child.get("subagents", []):
+                if isinstance(nested_stub, dict) and isinstance(
+                    nested_stub.get("thread_id"), str
+                ):
+                    stub_by_tid.setdefault(
+                        nested_stub["thread_id"], nested_stub
+                    )
+            queue.extend(children_by_parent.get(child_tid, []))
+        else:
+            c_role = stub.get("agent_role") or "default"
+            c_tokens = _empty_token_usage()
+            subagent_records.append(
+                {
+                    "thread_id": child_tid,
+                    "agent_role": c_role,
+                    "agent_nickname": None,
+                    "depth": 1,
+                    "model": None,
+                    "reasoning_effort": None,
+                    "command_count": 0,
+                    "failed_command_count": 0,
+                    "token_usage": c_tokens,
+                    "est_cost": None,
+                }
+            )
+    return subagent_records, subagent_tokens, subagent_cost_sum, subagent_cost_known
+
+
+def _collect_harness_eval_usage(
+    by_tid: dict[str, dict[str, Any]],
+    children_by_parent: dict[str, list[str]],
+    evals_root: Path,
+    installed_agents: set[str],
+) -> dict[str, Any]:
+    """Collect and aggregate Harness Eval Calls (worker trials, eval subagents, and semantic judges)."""
+    eval_root_sessions: list[dict[str, Any]] = []
+    seen_tids: set[str] = set()
+    seen_trial_dirs: set[str] = set()
+
+    for tid, entry in by_tid.items():
+        if entry.get("parent_thread_id"):
+            continue
+        if is_eval_run_cwd(entry.get("cwd"), evals_root):
+            eval_root_sessions.append(entry)
+            seen_tids.add(tid)
+            parsed_cwd = parse_eval_run_cwd(entry.get("cwd"), evals_root)
+            if parsed_cwd and parsed_cwd.get("trial_dir"):
+                seen_trial_dirs.add(str(parsed_cwd["trial_dir"]))
+
+    # Also discover any local worker/trace.jsonl on disk not already in ~/.codex/sessions
+    if evals_root.is_dir():
+        for worker_trace in sorted(
+            evals_root.glob("*/runs/*/trials/*/*/*/worker/trace.jsonl")
+        ):
+            trial_dir = worker_trace.parent.parent.resolve()
+            trial_dir_str = str(trial_dir)
+            if trial_dir_str in seen_trial_dirs:
+                continue
+            parsed_worker = parse_session_rollout(worker_trace)
+            tid = parsed_worker.get("thread_id") or str(worker_trace)
+            if tid in seen_tids:
+                continue
+            run_meta = read_json(trial_dir / "run.json")
+            if isinstance(run_meta, dict):
+                if not parsed_worker.get("model") and isinstance(
+                    run_meta.get("resolved_model"), str
+                ):
+                    parsed_worker["model"] = run_meta["resolved_model"]
+                if not parsed_worker.get("reasoning_effort") and isinstance(
+                    run_meta.get("resolved_reasoning_effort"), str
+                ):
+                    parsed_worker["reasoning_effort"] = run_meta[
+                        "resolved_reasoning_effort"
+                    ]
+                if isinstance(run_meta.get("started_at"), str):
+                    parsed_worker["started_at"] = run_meta["started_at"]
+            parsed_worker["cwd"] = str(trial_dir / "workspace")
+            parsed_worker["rollout_path"] = str(worker_trace)
+            eval_root_sessions.append(parsed_worker)
+            seen_tids.add(tid)
+            seen_trial_dirs.add(trial_dir_str)
+
+    # Scan semantic judge traces on disk (`grades/semantic/judge-*/trace.jsonl`)
+    judges_by_trial_dir: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    if evals_root.is_dir():
+        for judge_trace in sorted(
+            evals_root.glob("*/runs/*/trials/*/*/*/grades/semantic/judge-*/trace.jsonl")
+        ):
+            trial_dir = judge_trace.parents[3].resolve()
+            trial_dir_str = str(trial_dir)
+            run_meta = read_json(trial_dir / "run.json")
+            parsed_judge = parse_session_rollout(judge_trace)
+            j_model = parsed_judge.get("model")
+            j_effort = parsed_judge.get("reasoning_effort")
+            j_started = parsed_judge.get("started_at")
+            if isinstance(run_meta, dict):
+                if not j_model and isinstance(run_meta.get("resolved_model"), str):
+                    j_model = run_meta["resolved_model"]
+                if not j_effort and isinstance(
+                    run_meta.get("resolved_reasoning_effort"), str
+                ):
+                    j_effort = run_meta["resolved_reasoning_effort"]
+                if isinstance(run_meta.get("started_at"), str):
+                    j_started = run_meta["started_at"]
+            j_tokens = dict(parsed_judge.get("token_usage") or _empty_token_usage())
+            j_cost = estimate_api_cost(j_tokens, j_model)
+            judges_by_trial_dir[trial_dir_str].append(
+                {
+                    "judge_id": judge_trace.parent.name,
+                    "trace_path": str(judge_trace),
+                    "started_at": j_started,
+                    "model": j_model,
+                    "reasoning_effort": j_effort,
+                    "turn_count": int(parsed_judge.get("turn_count", 1) or 1),
+                    "token_usage": j_tokens,
+                    "est_cost": j_cost,
+                }
+            )
+
+    eval_root_sessions.sort(
+        key=lambda s: str(s.get("started_at") or ""),
+        reverse=True,
+    )
+
+    eval_sessions_summary: list[dict[str, Any]] = []
+    worker_tokens_total = _empty_token_usage()
+    judge_tokens_total = _empty_token_usage()
+    worker_cost_total = 0.0
+    judge_cost_total = 0.0
+    priced_worker_sessions = 0
+    priced_judge_calls = 0
+    total_worker_turns = 0
+    total_judge_turns = 0
+    total_eval_commands = 0
+    total_eval_failed_commands = 0
+    total_eval_subagent_spawns = 0
+    total_judge_calls = 0
+
+    eval_skill_stats: dict[str, dict[str, Any]] = {}
+    eval_agent_stats: dict[str, dict[str, Any]] = {}
+    eval_model_stats: dict[str, dict[str, Any]] = {}
+
+    def _record_eval_model(
+        model_name: str | None,
+        effort_name: str | None,
+        call_kind: str,
+        calls: int,
+        turns: int,
+        tokens: dict[str, int],
+        cost: float | None,
+    ) -> None:
+        m_key = model_name or "unknown"
+        e_key = effort_name or "default"
+        me_key = f"{m_key} ({e_key})"
+        if me_key not in eval_model_stats:
+            eval_model_stats[me_key] = {
+                "model": m_key,
+                "reasoning_effort": e_key,
+                "worker_calls": 0,
+                "subagent_calls": 0,
+                "judge_calls": 0,
+                "total_calls": 0,
+                "turns": 0,
+                "tokens": _empty_token_usage(),
+                "est_cost": 0.0,
+                "priced_count": 0,
+            }
+        ms = eval_model_stats[me_key]
+        if call_kind == "worker":
+            ms["worker_calls"] += calls
+        elif call_kind == "subagent":
+            ms["subagent_calls"] += calls
+        elif call_kind == "judge":
+            ms["judge_calls"] += calls
+        ms["total_calls"] += calls
+        ms["turns"] += turns
+        ms["tokens"] = _add_token_dicts(ms["tokens"], tokens)
+        if cost is not None:
+            ms["est_cost"] = round(ms["est_cost"] + cost, 6)
+            ms["priced_count"] += calls
+
+    def _ensure_eval_skill(sk_name: str) -> dict[str, Any]:
+        if sk_name not in eval_skill_stats:
+            eval_skill_stats[sk_name] = {
+                "skill": sk_name,
+                "experiments": set(),
+                "worker_trials": 0,
+                "baseline_trials": 0,
+                "with_skill_trials": 0,
+                "subagent_spawns": 0,
+                "judge_calls": 0,
+                "worker_tokens": _empty_token_usage(),
+                "judge_tokens": _empty_token_usage(),
+                "tokens": _empty_token_usage(),
+                "worker_est_cost": 0.0,
+                "judge_est_cost": 0.0,
+                "est_cost": 0.0,
+                "priced_count": 0,
+            }
+        return eval_skill_stats[sk_name]
+
+    consumed_judge_trial_dirs: set[str] = set()
+
+    for root in eval_root_sessions:
+        root_tid = root.get("thread_id") or root["rollout_path"]
+        parsed_meta = parse_eval_run_cwd(root.get("cwd"), evals_root) or {
+            "eval_skill": "unknown",
+            "experiment": "unknown",
+            "test_case": "unknown",
+            "configuration": "unknown",
+            "trial": "unknown",
+            "trial_dir": None,
+        }
+        trial_dir_str = parsed_meta.get("trial_dir")
+        r_model = root.get("model")
+        r_effort = root.get("reasoning_effort")
+        if trial_dir_str:
+            run_meta = read_json(Path(trial_dir_str) / "run.json")
+            if isinstance(run_meta, dict):
+                if not r_model and isinstance(run_meta.get("resolved_model"), str):
+                    r_model = run_meta["resolved_model"]
+                if not r_effort and isinstance(
+                    run_meta.get("resolved_reasoning_effort"), str
+                ):
+                    r_effort = run_meta["resolved_reasoning_effort"]
+
+        parent_tokens = dict(root.get("token_usage") or _empty_token_usage())
+        parent_cost = estimate_api_cost(parent_tokens, r_model)
+        (
+            subagent_records,
+            subagent_tokens,
+            subagent_cost_sum,
+            subagent_cost_known,
+        ) = _traverse_subagent_tree(root, root_tid, by_tid, children_by_parent)
+
+        roles_in_trial: set[str] = set()
+        for sub in subagent_records:
+            c_role = sub["agent_role"]
+            c_tokens = sub["token_usage"]
+            c_cost = sub["est_cost"]
+            c_cmd = sub["command_count"]
+            c_fail = sub["failed_command_count"]
+            if c_role not in eval_agent_stats:
+                eval_agent_stats[c_role] = {
+                    "role": c_role,
+                    "configured": c_role in installed_agents,
+                    "spawns": 0,
+                    "sessions_used": 0,
+                    "command_count": 0,
+                    "failed_command_count": 0,
+                    "tokens": _empty_token_usage(),
+                    "est_cost": 0.0,
+                    "priced_count": 0,
+                }
+            astat = eval_agent_stats[c_role]
+            astat["spawns"] += 1
+            astat["command_count"] += c_cmd
+            astat["failed_command_count"] += c_fail
+            astat["tokens"] = _add_token_dicts(astat["tokens"], c_tokens)
+            if c_cost is not None:
+                astat["est_cost"] = round(astat["est_cost"] + c_cost, 6)
+                astat["priced_count"] += 1
+            roles_in_trial.add(c_role)
+            _record_eval_model(
+                sub.get("model") or r_model,
+                sub.get("reasoning_effort") or r_effort,
+                "subagent",
+                1,
+                1,
+                c_tokens,
+                c_cost,
+            )
+        for r_name in roles_in_trial:
+            eval_agent_stats[r_name]["sessions_used"] += 1
+
+        trial_worker_tokens = _add_token_dicts(parent_tokens, subagent_tokens)
+        if parent_cost is not None or subagent_cost_known:
+            trial_worker_cost: float | None = round(
+                (parent_cost or 0.0) + subagent_cost_sum, 6
+            )
+        else:
+            trial_worker_cost = None
+
+        turns = int(root.get("turn_count", 1) or 1)
+        _record_eval_model(
+            r_model,
+            r_effort,
+            "worker",
+            1,
+            turns,
+            parent_tokens,
+            parent_cost,
+        )
+
+        # Attach semantic judges for this trial_dir if present
+        trial_judges: list[dict[str, Any]] = []
+        if trial_dir_str and trial_dir_str in judges_by_trial_dir:
+            trial_judges = judges_by_trial_dir[trial_dir_str]
+            consumed_judge_trial_dirs.add(trial_dir_str)
+
+        trial_judge_tokens = _empty_token_usage()
+        trial_judge_cost_sum = 0.0
+        trial_judge_cost_known = False
+        for j in trial_judges:
+            trial_judge_tokens = _add_token_dicts(
+                trial_judge_tokens, j["token_usage"]
+            )
+            if j["est_cost"] is not None:
+                trial_judge_cost_sum += j["est_cost"]
+                trial_judge_cost_known = True
+                priced_judge_calls += 1
+            total_judge_turns += int(j.get("turn_count", 1) or 1)
+            _record_eval_model(
+                j.get("model") or r_model,
+                j.get("reasoning_effort") or r_effort,
+                "judge",
+                1,
+                int(j.get("turn_count", 1) or 1),
+                j["token_usage"],
+                j["est_cost"],
+            )
+
+        trial_judge_cost: float | None = (
+            round(trial_judge_cost_sum, 6) if trial_judge_cost_known else None
+        )
+        total_judge_calls += len(trial_judges)
+        judge_tokens_total = _add_token_dicts(judge_tokens_total, trial_judge_tokens)
+        if trial_judge_cost is not None:
+            judge_cost_total = round(judge_cost_total + trial_judge_cost, 6)
+
+        trial_total_tokens = _add_token_dicts(
+            trial_worker_tokens, trial_judge_tokens
+        )
+        if trial_worker_cost is not None or trial_judge_cost is not None:
+            trial_total_cost: float | None = round(
+                (trial_worker_cost or 0.0) + (trial_judge_cost or 0.0), 6
+            )
+        else:
+            trial_total_cost = None
+
+        cmds = int(root.get("command_count", 0) or 0) + sum(
+            s["command_count"] for s in subagent_records
+        )
+        failed_cmds = int(root.get("failed_command_count", 0) or 0) + sum(
+            s["failed_command_count"] for s in subagent_records
+        )
+        spawns = max(
+            int(root.get("subagent_spawn_count", 0) or 0), len(subagent_records)
+        )
+
+        worker_tokens_total = _add_token_dicts(
+            worker_tokens_total, trial_worker_tokens
+        )
+        if trial_worker_cost is not None:
+            worker_cost_total = round(worker_cost_total + trial_worker_cost, 6)
+            priced_worker_sessions += 1
+        total_worker_turns += turns
+        total_eval_commands += cmds
+        total_eval_failed_commands += failed_cmds
+        total_eval_subagent_spawns += spawns
+
+        sk_name = str(parsed_meta["eval_skill"])
+        es = _ensure_eval_skill(sk_name)
+        exp_name = str(parsed_meta["experiment"])
+        if exp_name and exp_name != "unknown":
+            es["experiments"].add(exp_name)
+        es["worker_trials"] += 1
+        cfg_name = str(parsed_meta["configuration"])
+        if cfg_name == "baseline":
+            es["baseline_trials"] += 1
+        elif cfg_name == "with-skill":
+            es["with_skill_trials"] += 1
+        es["subagent_spawns"] += spawns
+        es["judge_calls"] += len(trial_judges)
+        es["worker_tokens"] = _add_token_dicts(
+            es["worker_tokens"], trial_worker_tokens
+        )
+        es["judge_tokens"] = _add_token_dicts(
+            es["judge_tokens"], trial_judge_tokens
+        )
+        es["tokens"] = _add_token_dicts(es["tokens"], trial_total_tokens)
+        if trial_worker_cost is not None:
+            es["worker_est_cost"] = round(
+                es["worker_est_cost"] + trial_worker_cost, 6
+            )
+        if trial_judge_cost is not None:
+            es["judge_est_cost"] = round(
+                es["judge_est_cost"] + trial_judge_cost, 6
+            )
+        if trial_total_cost is not None:
+            es["est_cost"] = round(es["est_cost"] + trial_total_cost, 6)
+            es["priced_count"] += 1
+
+        started_str = str(root.get("started_at") or "")
+        day_key = started_str[:10] if len(started_str) >= 10 else "unknown"
+        eval_sessions_summary.append(
+            {
+                "thread_id": root_tid,
+                "started_at": started_str,
+                "date": day_key,
+                "cwd": root.get("cwd"),
+                "eval_skill": sk_name,
+                "experiment": exp_name,
+                "test_case": str(parsed_meta["test_case"]),
+                "configuration": cfg_name,
+                "trial": str(parsed_meta["trial"]),
+                "model": r_model,
+                "reasoning_effort": r_effort,
+                "turn_count": turns,
+                "command_count": cmds,
+                "failed_command_count": failed_cmds,
+                "first_prompt": root.get("first_prompt") or "",
+                "subagent_spawn_count": spawns,
+                "subagents": subagent_records,
+                "judge_call_count": len(trial_judges),
+                "judge_tokens": trial_judge_tokens,
+                "judge_est_cost": trial_judge_cost,
+                "parent_token_usage": parent_tokens,
+                "subagent_token_usage": subagent_tokens,
+                "worker_tokens": trial_worker_tokens,
+                "worker_est_cost": trial_worker_cost,
+                "token_usage": trial_total_tokens,
+                "est_cost": trial_total_cost,
+            }
+        )
+
+    # Include any orphan judge calls whose trial_dir had no worker rollout
+    for trial_dir_str, orphan_judges in sorted(judges_by_trial_dir.items()):
+        if trial_dir_str in consumed_judge_trial_dirs:
+            continue
+        parsed_meta = parse_eval_run_cwd(trial_dir_str, evals_root) or {
+            "eval_skill": "unknown",
+            "experiment": "unknown",
+            "test_case": "unknown",
+            "configuration": "unknown",
+            "trial": "unknown",
+        }
+        sk_name = str(parsed_meta["eval_skill"])
+        es = _ensure_eval_skill(sk_name)
+        exp_name = str(parsed_meta["experiment"])
+        if exp_name and exp_name != "unknown":
+            es["experiments"].add(exp_name)
+        for j in orphan_judges:
+            total_judge_calls += 1
+            total_judge_turns += int(j.get("turn_count", 1) or 1)
+            judge_tokens_total = _add_token_dicts(
+                judge_tokens_total, j["token_usage"]
+            )
+            es["judge_calls"] += 1
+            es["judge_tokens"] = _add_token_dicts(
+                es["judge_tokens"], j["token_usage"]
+            )
+            es["tokens"] = _add_token_dicts(es["tokens"], j["token_usage"])
+            if j["est_cost"] is not None:
+                judge_cost_total = round(judge_cost_total + j["est_cost"], 6)
+                priced_judge_calls += 1
+                es["judge_est_cost"] = round(
+                    es["judge_est_cost"] + j["est_cost"], 6
+                )
+                es["est_cost"] = round(es["est_cost"] + j["est_cost"], 6)
+                es["priced_count"] += 1
+            _record_eval_model(
+                j.get("model"),
+                j.get("reasoning_effort"),
+                "judge",
+                1,
+                int(j.get("turn_count", 1) or 1),
+                j["token_usage"],
+                j["est_cost"],
+            )
+
+    combined_eval_tokens = _add_token_dicts(worker_tokens_total, judge_tokens_total)
+    eval_input = combined_eval_tokens["input_tokens"]
+    eval_cache_hit_pct = (
+        round(combined_eval_tokens["cached_input_tokens"] / eval_input * 100, 1)
+        if eval_input > 0
+        else 0.0
+    )
+    priced_calls = priced_worker_sessions + priced_judge_calls
+    total_eval_cost = (
+        round(worker_cost_total + judge_cost_total, 6)
+        if priced_calls > 0
+        else None
+    )
+
+    by_skill_list: list[dict[str, Any]] = []
+    for sk_entry in eval_skill_stats.values():
+        exps = sorted(sk_entry["experiments"])
+        by_skill_list.append(
+            {
+                "skill": sk_entry["skill"],
+                "experiments": exps,
+                "experiment_count": len(exps),
+                "worker_trials": sk_entry["worker_trials"],
+                "baseline_trials": sk_entry["baseline_trials"],
+                "with_skill_trials": sk_entry["with_skill_trials"],
+                "subagent_spawns": sk_entry["subagent_spawns"],
+                "judge_calls": sk_entry["judge_calls"],
+                "worker_tokens": sk_entry["worker_tokens"],
+                "judge_tokens": sk_entry["judge_tokens"],
+                "tokens": sk_entry["tokens"],
+                "worker_est_cost": sk_entry["worker_est_cost"],
+                "judge_est_cost": sk_entry["judge_est_cost"],
+                "est_cost": sk_entry["est_cost"],
+                "priced_count": sk_entry["priced_count"],
+            }
+        )
+    by_skill_list.sort(key=lambda s: (-s["worker_trials"], s["skill"]))
+
+    return {
+        "totals": {
+            "worker_session_count": len(eval_sessions_summary),
+            "subagent_spawn_count": total_eval_subagent_spawns,
+            "judge_call_count": total_judge_calls,
+            "total_call_count": (
+                len(eval_sessions_summary)
+                + total_eval_subagent_spawns
+                + total_judge_calls
+            ),
+            "turn_count": total_worker_turns + total_judge_turns,
+            "worker_turn_count": total_worker_turns,
+            "judge_turn_count": total_judge_turns,
+            "command_count": total_eval_commands,
+            "failed_command_count": total_eval_failed_commands,
+            "cache_hit_pct": eval_cache_hit_pct,
+            "worker_tokens": worker_tokens_total,
+            "judge_tokens": judge_tokens_total,
+            "tokens": combined_eval_tokens,
+            "worker_est_cost": (
+                round(worker_cost_total, 6) if priced_worker_sessions > 0 else None
+            ),
+            "judge_est_cost": (
+                round(judge_cost_total, 6) if priced_judge_calls > 0 else None
+            ),
+            "est_cost": total_eval_cost,
+            "priced_calls": priced_calls,
+        },
+        "by_skill": by_skill_list,
+        "subagents": sorted(
+            eval_agent_stats.values(),
+            key=lambda a: (-a["spawns"], a["role"]),
+        ),
+        "models": sorted(
+            eval_model_stats.values(),
+            key=lambda m: (-m["total_calls"], m["model"]),
+        ),
+        "sessions": eval_sessions_summary,
+    }
+
+
 def build_project_usage(
     rollouts_by_path: dict[str, dict[str, Any]],
     project_root: Path,
     evals_root: Path,
 ) -> dict[str, Any]:
-    """Filter, link parent/subagent trees, and aggregate usage metrics for `project_root`."""
+    """Filter, link parent/subagent trees, and aggregate usage metrics for `project_root`.
+
+    Splits telemetry into:
+    1. Real Project Work (`totals`, `skills`, `subagents`, `models`, `daily`, `sessions`)
+    2. Harness Eval Calls (`harness_evals`: `eval.py run` worker trials, eval subagents, semantic judges)
+    3. Combined Totals (`combined_totals`)
+    """
     inventory = discover_project_inventory(project_root, evals_root)
     installed_skills = set(inventory["skills"])
     installed_agents = set(inventory["agent_profiles"])
@@ -559,7 +1218,11 @@ def build_project_usage(
 
     sessions_summary: list[dict[str, Any]] = []
     total_tokens = _empty_token_usage()
+    total_parent_tokens = _empty_token_usage()
+    total_subagent_tokens = _empty_token_usage()
     total_cost = 0.0
+    total_parent_cost = 0.0
+    total_subagent_cost = 0.0
     priced_sessions = 0
     total_turns = 0
     total_commands = 0
@@ -603,86 +1266,20 @@ def build_project_usage(
         parent_tokens = dict(root.get("token_usage") or _empty_token_usage())
         parent_cost = estimate_api_cost(parent_tokens, root.get("model"))
 
-        # Traverse descendant subagent tree
-        subagent_records: list[dict[str, Any]] = []
-        subagent_tokens = _empty_token_usage()
-        subagent_cost_sum = 0.0
-        subagent_cost_known = False
+        (
+            subagent_records,
+            subagent_tokens,
+            subagent_cost_sum,
+            subagent_cost_known,
+        ) = _traverse_subagent_tree(root, root_tid, by_tid, children_by_parent)
 
-        stub_by_tid = {
-            s.get("thread_id"): s
-            for s in root.get("subagents", [])
-            if isinstance(s, dict) and isinstance(s.get("thread_id"), str)
-        }
-        queue = list(children_by_parent.get(root_tid, []))
-        visited = {root_tid}
         roles_in_session: set[str] = set()
-
-        while queue:
-            child_tid = queue.pop(0)
-            if child_tid in visited:
-                continue
-            visited.add(child_tid)
-            child = by_tid.get(child_tid)
-            stub = stub_by_tid.get(child_tid, {})
-            if child is not None:
-                c_tokens = dict(child.get("token_usage") or _empty_token_usage())
-                c_model = child.get("model") or root.get("model")
-                c_cost = estimate_api_cost(c_tokens, c_model)
-                c_role = (
-                    child.get("agent_role")
-                    or stub.get("agent_role")
-                    or "default"
-                )
-                c_cmd = int(child.get("command_count", 0) or 0)
-                c_fail = int(child.get("failed_command_count", 0) or 0)
-                subagent_tokens = _add_token_dicts(subagent_tokens, c_tokens)
-                if c_cost is not None:
-                    subagent_cost_sum += c_cost
-                    subagent_cost_known = True
-                subagent_records.append(
-                    {
-                        "thread_id": child_tid,
-                        "agent_role": c_role,
-                        "agent_nickname": child.get("agent_nickname"),
-                        "depth": child.get("depth") or 1,
-                        "model": c_model,
-                        "reasoning_effort": child.get("reasoning_effort"),
-                        "command_count": c_cmd,
-                        "failed_command_count": c_fail,
-                        "token_usage": c_tokens,
-                        "est_cost": c_cost,
-                    }
-                )
-                for nested_stub in child.get("subagents", []):
-                    if isinstance(nested_stub, dict) and isinstance(
-                        nested_stub.get("thread_id"), str
-                    ):
-                        stub_by_tid.setdefault(
-                            nested_stub["thread_id"], nested_stub
-                        )
-                queue.extend(children_by_parent.get(child_tid, []))
-            else:
-                c_role = stub.get("agent_role") or "default"
-                c_tokens = _empty_token_usage()
-                c_cost = None
-                c_cmd = 0
-                c_fail = 0
-                subagent_records.append(
-                    {
-                        "thread_id": child_tid,
-                        "agent_role": c_role,
-                        "agent_nickname": None,
-                        "depth": 1,
-                        "model": None,
-                        "reasoning_effort": None,
-                        "command_count": 0,
-                        "failed_command_count": 0,
-                        "token_usage": c_tokens,
-                        "est_cost": None,
-                    }
-                )
-
+        for sub in subagent_records:
+            c_role = sub["agent_role"]
+            c_tokens = sub["token_usage"]
+            c_cost = sub["est_cost"]
+            c_cmd = sub["command_count"]
+            c_fail = sub["failed_command_count"]
             if c_role not in agent_stats:
                 agent_stats[c_role] = {
                     "role": c_role,
@@ -761,6 +1358,14 @@ def build_project_usage(
         )
 
         total_tokens = _add_token_dicts(total_tokens, combined_tokens)
+        total_parent_tokens = _add_token_dicts(total_parent_tokens, parent_tokens)
+        total_subagent_tokens = _add_token_dicts(
+            total_subagent_tokens, subagent_tokens
+        )
+        if parent_cost is not None:
+            total_parent_cost = round(total_parent_cost + parent_cost, 6)
+        if subagent_cost_known:
+            total_subagent_cost = round(total_subagent_cost + subagent_cost_sum, 6)
         if session_cost is not None:
             total_cost = round(total_cost + session_cost, 6)
             priced_sessions += 1
@@ -838,6 +1443,30 @@ def build_project_usage(
         if total_input > 0
         else 0.0
     )
+    real_est_cost = round(total_cost, 6) if priced_sessions > 0 else None
+
+    harness_evals = _collect_harness_eval_usage(
+        by_tid=by_tid,
+        children_by_parent=children_by_parent,
+        evals_root=evals_root,
+        installed_agents=installed_agents,
+    )
+    eval_totals = harness_evals["totals"]
+    combined_all_tokens = _add_token_dicts(total_tokens, eval_totals["tokens"])
+    combined_input = combined_all_tokens["input_tokens"]
+    combined_cache_hit_pct = (
+        round(
+            combined_all_tokens["cached_input_tokens"] / combined_input * 100, 1
+        )
+        if combined_input > 0
+        else 0.0
+    )
+    if real_est_cost is not None or eval_totals["est_cost"] is not None:
+        combined_est_cost: float | None = round(
+            (real_est_cost or 0.0) + (eval_totals["est_cost"] or 0.0), 6
+        )
+    else:
+        combined_est_cost = None
 
     return {
         "project_name": project_root.name,
@@ -850,8 +1479,18 @@ def build_project_usage(
             "failed_command_count": total_failed_commands,
             "subagent_spawn_count": total_subagent_spawns,
             "cache_hit_pct": cache_hit_pct,
+            "parent_tokens": total_parent_tokens,
+            "subagent_tokens": total_subagent_tokens,
             "tokens": total_tokens,
-            "est_cost": round(total_cost, 6) if priced_sessions > 0 else None,
+            "parent_est_cost": (
+                round(total_parent_cost, 6) if priced_sessions > 0 else None
+            ),
+            "subagent_est_cost": (
+                round(total_subagent_cost, 6)
+                if total_subagent_spawns > 0
+                else None
+            ),
+            "est_cost": real_est_cost,
             "priced_sessions": priced_sessions,
         },
         "skills": sorted(
@@ -872,16 +1511,80 @@ def build_project_usage(
             reverse=True,
         ),
         "sessions": sessions_summary,
+        "harness_evals": harness_evals,
+        "combined_totals": {
+            "real_session_count": len(sessions_summary),
+            "real_subagent_count": total_subagent_spawns,
+            "eval_worker_count": eval_totals["worker_session_count"],
+            "eval_subagent_count": eval_totals["subagent_spawn_count"],
+            "eval_judge_count": eval_totals["judge_call_count"],
+            "eval_call_count": eval_totals["total_call_count"],
+            "cache_hit_pct": combined_cache_hit_pct,
+            "tokens": combined_all_tokens,
+            "est_cost": combined_est_cost,
+        },
+    }
+
+
+def _default_harness_evals() -> dict[str, Any]:
+    empty_tok = _empty_token_usage()
+    return {
+        "totals": {
+            "worker_session_count": 0,
+            "subagent_spawn_count": 0,
+            "judge_call_count": 0,
+            "total_call_count": 0,
+            "turn_count": 0,
+            "worker_turn_count": 0,
+            "judge_turn_count": 0,
+            "command_count": 0,
+            "failed_command_count": 0,
+            "cache_hit_pct": 0.0,
+            "worker_tokens": dict(empty_tok),
+            "judge_tokens": dict(empty_tok),
+            "tokens": dict(empty_tok),
+            "worker_est_cost": None,
+            "judge_est_cost": None,
+            "est_cost": None,
+            "priced_calls": 0,
+        },
+        "by_skill": [],
+        "subagents": [],
+        "models": [],
+        "sessions": [],
     }
 
 
 def render_usage_markdown(summary: dict[str, Any]) -> str:
-    """Render the human-readable `_usage/report.md` for a project."""
+    """Render the human-readable `_usage/report.md` for a project, split into Real Project Work and Harness Eval Calls."""
     totals = summary["totals"]
     tok = totals["tokens"]
     total_cost_str = (
         format_cost(totals["est_cost"])
         if totals["session_count"] > 0
+        else "$0.0000"
+    )
+    harness_evals = summary.get("harness_evals") or _default_harness_evals()
+    etotals = harness_evals["totals"]
+    etok = etotals["tokens"]
+    eval_cost_str = (
+        format_cost(etotals["est_cost"])
+        if etotals["total_call_count"] > 0
+        else "$0.0000"
+    )
+    combined = summary.get("combined_totals") or {
+        "tokens": _add_token_dicts(tok, etok),
+        "cache_hit_pct": totals.get("cache_hit_pct", 0.0),
+        "est_cost": (
+            round((totals.get("est_cost") or 0.0) + (etotals.get("est_cost") or 0.0), 6)
+            if (totals.get("est_cost") is not None or etotals.get("est_cost") is not None)
+            else None
+        ),
+    }
+    ctok = combined["tokens"]
+    combined_cost_str = (
+        format_cost(combined["est_cost"])
+        if (totals["session_count"] + etotals["total_call_count"]) > 0
         else "$0.0000"
     )
 
@@ -890,22 +1593,38 @@ def render_usage_markdown(summary: dict[str, Any]) -> str:
         "",
         f"**Project root:** `{summary['project_root']}` · **Updated:** `{summary['generated_at']}`",
         "",
-        "## Overview",
+        "## Workload split (Real Project Work vs Harness Eval Calls)",
         "",
-        "| Sessions | Turns | Commands (failed) | Subagent spawns | Uncached input | Cached input (hit %) | Billed output | Est. API cost |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Workload | Root sessions / trials | Subagents | Judges | Turns | Uncached input | Cached input (hit %) | Billed output | Est. API cost |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {totals['session_count']} | {totals['turn_count']} | "
-            f"{totals['command_count']} ({totals['failed_command_count']}) | "
-            f"{totals['subagent_spawn_count']} | "
+            f"| **Real Project Work** | {totals['session_count']} | "
+            f"{totals['subagent_spawn_count']} | 0 | {totals['turn_count']} | "
             f"{tok['uncached_input_tokens']:,} | "
             f"{tok['cached_input_tokens']:,} ({totals['cache_hit_pct']}%) | "
             f"{tok['billed_output_tokens']:,} | {total_cost_str} |"
         ),
+        (
+            f"| **Harness Eval Calls** | {etotals['worker_session_count']} | "
+            f"{etotals['subagent_spawn_count']} | {etotals['judge_call_count']} | "
+            f"{etotals['turn_count']} | "
+            f"{etok['uncached_input_tokens']:,} | "
+            f"{etok['cached_input_tokens']:,} ({etotals['cache_hit_pct']}%) | "
+            f"{etok['billed_output_tokens']:,} | {eval_cost_str} |"
+        ),
+        (
+            f"| **Combined Total** | {totals['session_count'] + etotals['worker_session_count']} | "
+            f"{totals['subagent_spawn_count'] + etotals['subagent_spawn_count']} | "
+            f"{etotals['judge_call_count']} | "
+            f"{totals['turn_count'] + etotals['turn_count']} | "
+            f"{ctok['uncached_input_tokens']:,} | "
+            f"{ctok['cached_input_tokens']:,} ({combined['cache_hit_pct']}%) | "
+            f"{ctok['billed_output_tokens']:,} | {combined_cost_str} |"
+        ),
         "",
         f"> **Cost note:** `Est. API cost` is an API-equivalent estimate at public OpenAI list prices (as of {PRICING_AS_OF}, {PRICING_SOURCE}; long-context tier at {LONG_CONTEXT_THRESHOLD:,} input tokens). It is not actual subscription or credit spend.",
         "",
-        "## Skill usage",
+        "## 1. Real project work — Skill usage",
         "",
         "| Skill | Installed in project | Sessions triggered | Explicit / Implicit | Uncached input | Cached input | Billed output | Est. cost |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
@@ -934,7 +1653,7 @@ def render_usage_markdown(summary: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Subagent usage",
+            "## 1b. Real project work — Subagent usage",
             "",
             "| Agent role | Configured in `.codex/agents` | Spawns | Sessions used | Commands (failed) | Uncached input | Cached input | Billed output | Est. cost |",
             "|---|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -963,7 +1682,7 @@ def render_usage_markdown(summary: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Recent sessions",
+            "## 1c. Real project work — Recent sessions",
             "",
             "| Started | Thread ID | Model (effort) | Turns | Skills | Subagents | Billed output | Est. cost | First prompt |",
             "|---|---|---|---:|---|---:|---:|---:|---|",
@@ -992,12 +1711,38 @@ def render_usage_markdown(summary: dict[str, Any]) -> str:
     else:
         lines.append("| — | — | — | 0 | — | 0 | 0 | $0.0000 | No project sessions recorded yet |")
 
+    lines.extend(
+        [
+            "",
+            "## 2. Harness eval calls (`eval.py run` workers, eval subagents & semantic judges)",
+            "",
+            "| Evaluated skill | Experiments | Worker trials (`with-skill` / `baseline`) | Eval subagents | Semantic judges | Worker billed out | Judge billed out | Worker cost | Judge cost | Total eval cost |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if harness_evals["by_skill"]:
+        for es in harness_evals["by_skill"]:
+            wtok = es["worker_tokens"]
+            jtok = es["judge_tokens"]
+            w_cost = format_cost(es["worker_est_cost"]) if es["worker_trials"] > 0 else "$0.0000"
+            j_cost = format_cost(es["judge_est_cost"]) if es["judge_calls"] > 0 else "$0.0000"
+            t_cost = format_cost(es["est_cost"]) if es["priced_count"] > 0 else "$0.0000"
+            lines.append(
+                f"| `{markdown_cell(es['skill'])}` | {es['experiment_count']} | "
+                f"{es['worker_trials']} ({es['with_skill_trials']} / {es['baseline_trials']}) | "
+                f"{es['subagent_spawns']} | {es['judge_calls']} | "
+                f"{wtok['billed_output_tokens']:,} | {jtok['billed_output_tokens']:,} | "
+                f"{w_cost} | {j_cost} | {t_cost} |"
+            )
+    else:
+        lines.append("| (none) | 0 | 0 (0 / 0) | 0 | 0 | 0 | 0 | $0.0000 | $0.0000 | $0.0000 |")
+
     lines.append("")
     return "\n".join(lines)
 
 
 def render_usage_html(summary: dict[str, Any]) -> str:
-    """Render a self-contained interactive HTML dashboard (`_usage/report.html`)."""
+    """Render a self-contained light-mode HTML dashboard (`_usage/report.html`) in the `do-work` log style."""
     totals = summary["totals"]
     tok = totals["tokens"]
     total_cost_str = (
@@ -1005,6 +1750,30 @@ def render_usage_html(summary: dict[str, Any]) -> str:
         if totals["session_count"] > 0
         else "$0.0000"
     )
+    harness_evals = summary.get("harness_evals") or _default_harness_evals()
+    etotals = harness_evals["totals"]
+    etok = etotals["tokens"]
+    eval_cost_str = (
+        format_cost(etotals["est_cost"])
+        if etotals["total_call_count"] > 0
+        else "$0.0000"
+    )
+    combined = summary.get("combined_totals") or {
+        "tokens": _add_token_dicts(tok, etok),
+        "cache_hit_pct": totals.get("cache_hit_pct", 0.0),
+        "est_cost": (
+            round((totals.get("est_cost") or 0.0) + (etotals.get("est_cost") or 0.0), 6)
+            if (totals.get("est_cost") is not None or etotals.get("est_cost") is not None)
+            else None
+        ),
+    }
+    ctok = combined["tokens"]
+    combined_cost_str = (
+        format_cost(combined["est_cost"])
+        if (totals["session_count"] + etotals["total_call_count"]) > 0
+        else "$0.0000"
+    )
+
     project_name = html.escape(summary["project_name"])
     project_root = html.escape(summary["project_root"])
     generated_at = html.escape(summary["generated_at"][:19].replace("T", " ") + " UTC")
@@ -1021,17 +1790,17 @@ def render_usage_html(summary: dict[str, Any]) -> str:
             else ("$0.0000" if sk["sessions_triggered"] == 0 else "n/a")
         )
         pct = int(round(sk["sessions_triggered"] / max_skill_sessions * 100))
-        badge_cls = "badge-ok" if sk["sessions_triggered"] > 0 else "badge-muted"
+        badge_cls = "ok" if sk["sessions_triggered"] > 0 else "neutral"
         status_text = "Installed" if sk["installed"] else "External"
         unused_tag = (
-            ' <span class="badge badge-warn">0 triggers</span>'
+            ' <span class="pill warn">0 triggers</span>'
             if sk["installed"] and sk["sessions_triggered"] == 0
             else ""
         )
         skill_rows_html.append(
             f"<tr>"
             f"<td><code>{html.escape(sk['skill'])}</code>{unused_tag}</td>"
-            f"<td><span class='badge {badge_cls}'>{status_text}</span></td>"
+            f"<td><span class='pill {badge_cls}'>{status_text}</span></td>"
             f"<td class='num'><div class='bar-cell'><span>{sk['sessions_triggered']}</span>"
             f"<div class='bar-track'><div class='bar-fill' style='width:{pct}%'></div></div></div></td>"
             f"<td class='num'>{sk['explicit_count']} / {sk['implicit_count']}</td>"
@@ -1055,14 +1824,19 @@ def render_usage_html(summary: dict[str, Any]) -> str:
             else ("$0.0000" if ag["spawns"] == 0 else "n/a")
         )
         unused_tag = (
-            ' <span class="badge badge-warn">0 spawns</span>'
+            ' <span class="pill warn">0 spawns</span>'
             if ag["configured"] and ag["spawns"] == 0
             else ""
+        )
+        src_pill = (
+            "<span class='pill info'>Configured</span>"
+            if ag["configured"]
+            else "<span class='pill neutral'>Built-in / ad-hoc</span>"
         )
         subagent_rows_html.append(
             f"<tr>"
             f"<td><code>{html.escape(ag['role'])}</code>{unused_tag}</td>"
-            f"<td>{'Configured' if ag['configured'] else 'Built-in / ad-hoc'}</td>"
+            f"<td>{src_pill}</td>"
             f"<td class='num'>{ag['spawns']}</td>"
             f"<td class='num'>{ag['sessions_used']}</td>"
             f"<td class='num'>{ag['command_count']} ({ag['failed_command_count']})</td>"
@@ -1126,7 +1900,7 @@ def render_usage_html(summary: dict[str, Any]) -> str:
         skills_csv = ",".join(sess["skills_used"])
         skills_badges = (
             " ".join(
-                f"<span class='badge badge-skill'>{html.escape(s)}</span>"
+                f"<span class='pill info'>{html.escape(s)}</span>"
                 for s in sess["skills_used"]
             )
             if sess["skills_used"]
@@ -1137,8 +1911,8 @@ def render_usage_html(summary: dict[str, Any]) -> str:
         short_tid = html.escape(str(sess["thread_id"])[:12])
         cost_str = html.escape(format_cost(sess["est_cost"]))
 
-        sub_Toggle = (
-            f"<button class='btn-expand' onclick='toggleSub({idx})'>"
+        sub_toggle = (
+            f"<button class='btn-expand' onclick='toggleSub(\"sub-{idx}\")'>"
             f"{sess['subagent_spawn_count']} subagent(s) ▾</button>"
             if sess["subagents"]
             else str(sess["subagent_spawn_count"])
@@ -1156,12 +1930,12 @@ def render_usage_html(summary: dict[str, Any]) -> str:
             f"<td class='num'>{sess['turn_count']}</td>"
             f"<td class='num'>{sess['command_count']} ({sess['failed_command_count']})</td>"
             f"<td>{skills_badges}</td>"
-            f"<td class='num'>{sub_Toggle}</td>"
+            f"<td class='num'>{sub_toggle}</td>"
             f"<td class='num'>{stok['uncached_input_tokens']:,}</td>"
             f"<td class='num'>{stok['cached_input_tokens']:,}</td>"
             f"<td class='num'>{stok['billed_output_tokens']:,}</td>"
             f"<td class='num'>{cost_str}</td>"
-            f"<td class='prompt-cell'>{prompt_text}</td>"
+            f"<td class='prompt-cell' title='{prompt_text}'>{prompt_text}</td>"
             f"</tr>"
         )
         if sess["subagents"]:
@@ -1205,7 +1979,157 @@ def render_usage_html(summary: dict[str, Any]) -> str:
 
     if not session_rows_html:
         session_rows_html.append(
-            "<tr><td colspan='12' class='empty'>No Codex sessions recorded for this project yet.</td></tr>"
+            "<tr><td colspan='12' class='empty'>No real project work sessions recorded yet.</td></tr>"
+        )
+
+    # Harness eval tables
+    eval_skill_rows_html: list[str] = []
+    for es in harness_evals["by_skill"]:
+        wtok = es["worker_tokens"]
+        jtok = es["judge_tokens"]
+        etok_row = es["tokens"]
+        w_cost = format_cost(es["worker_est_cost"]) if es["worker_trials"] > 0 else "$0.0000"
+        j_cost = format_cost(es["judge_est_cost"]) if es["judge_calls"] > 0 else "$0.0000"
+        t_cost = format_cost(es["est_cost"]) if es["priced_count"] > 0 else "$0.0000"
+        exps_badges = " ".join(
+            f"<span class='pill neutral'>{html.escape(exp)}</span>"
+            for exp in es["experiments"]
+        )
+        eval_skill_rows_html.append(
+            f"<tr>"
+            f"<td><code>{html.escape(es['skill'])}</code></td>"
+            f"<td>{exps_badges or '—'}</td>"
+            f"<td class='num'>{es['worker_trials']} <span class='muted'>({es['with_skill_trials']}w / {es['baseline_trials']}b)</span></td>"
+            f"<td class='num'>{es['subagent_spawns']}</td>"
+            f"<td class='num'>{es['judge_calls']}</td>"
+            f"<td class='num'>{etok_row['uncached_input_tokens']:,}</td>"
+            f"<td class='num'>{etok_row['cached_input_tokens']:,}</td>"
+            f"<td class='num'>{wtok['billed_output_tokens']:,}</td>"
+            f"<td class='num'>{jtok['billed_output_tokens']:,}</td>"
+            f"<td class='num'>{html.escape(w_cost)}</td>"
+            f"<td class='num'>{html.escape(j_cost)}</td>"
+            f"<td class='num'><strong>{html.escape(t_cost)}</strong></td>"
+            f"</tr>"
+        )
+    if not eval_skill_rows_html:
+        eval_skill_rows_html.append(
+            "<tr><td colspan='12' class='empty'>No harness eval runs recorded under <code>&lt;skill&gt;/runs/</code>.</td></tr>"
+        )
+
+    eval_subagent_rows_html: list[str] = []
+    for ag in harness_evals["subagents"]:
+        atok = ag["tokens"]
+        cost_cell = (
+            format_cost(ag["est_cost"])
+            if ag["priced_count"] > 0
+            else ("$0.0000" if ag["spawns"] == 0 else "n/a")
+        )
+        src_pill = (
+            "<span class='pill info'>Configured</span>"
+            if ag["configured"]
+            else "<span class='pill neutral'>Built-in / ad-hoc</span>"
+        )
+        eval_subagent_rows_html.append(
+            f"<tr>"
+            f"<td><code>{html.escape(ag['role'])}</code></td>"
+            f"<td>{src_pill}</td>"
+            f"<td class='num'>{ag['spawns']}</td>"
+            f"<td class='num'>{ag['sessions_used']}</td>"
+            f"<td class='num'>{ag['command_count']} ({ag['failed_command_count']})</td>"
+            f"<td class='num'>{atok['uncached_input_tokens']:,}</td>"
+            f"<td class='num'>{atok['cached_input_tokens']:,}</td>"
+            f"<td class='num'>{atok['billed_output_tokens']:,}</td>"
+            f"<td class='num'>{html.escape(cost_cell)}</td>"
+            f"</tr>"
+        )
+    if not eval_subagent_rows_html:
+        eval_subagent_rows_html.append(
+            "<tr><td colspan='9' class='empty'>No subagent spawns recorded inside harness eval runs.</td></tr>"
+        )
+
+    eval_session_rows_html: list[str] = []
+    eval_skill_options = sorted({s["skill"] for s in harness_evals["by_skill"]})
+    for idx, esess in enumerate(harness_evals["sessions"]):
+        stok = esess["token_usage"]
+        model_name = esess["model"] or "unknown"
+        model_label = (
+            f"{model_name} ({esess['reasoning_effort']})"
+            if esess.get("reasoning_effort")
+            else model_name
+        )
+        cfg = esess.get("config") or "—"
+        cfg_cls = "ok" if cfg == "with-skill" else ("info" if cfg == "baseline" else "neutral")
+        started_short = html.escape((esess.get("started_at") or "")[:19].replace("T", " ") or "—")
+        cost_str = html.escape(format_cost(esess["est_cost"]))
+        trial_label = f"{esess.get('case_id') or '—'} #{esess.get('trial_id') or '1'}"
+        sub_toggle = (
+            f"<button class='btn-expand' onclick='toggleSub(\"eval-sub-{idx}\")'>"
+            f"{esess['subagent_spawn_count']} subagent(s) ▾</button>"
+            if esess.get("subagents")
+            else str(esess.get("subagent_spawn_count", 0))
+        )
+        eval_search_blob = html.escape(
+            f"{esess.get('evaluated_skill')} {esess.get('experiment')} {esess.get('case_id')} {cfg} {model_label} {esess.get('first_prompt')}".lower()
+        )
+        eval_session_rows_html.append(
+            f"<tr class='eval-session-row' data-skill='{html.escape(str(esess.get('evaluated_skill') or ''))}' "
+            f"data-config='{html.escape(cfg)}' data-search='{eval_search_blob}'>"
+            f"<td><code>{started_short}</code></td>"
+            f"<td><code>{html.escape(str(esess.get('evaluated_skill') or '—'))}</code></td>"
+            f"<td><code>{html.escape(str(esess.get('experiment') or '—'))}</code></td>"
+            f"<td><code>{html.escape(trial_label)}</code></td>"
+            f"<td><span class='pill {cfg_cls}'>{html.escape(cfg)}</span></td>"
+            f"<td><code>{html.escape(model_label)}</code></td>"
+            f"<td class='num'>{esess['turn_count']}</td>"
+            f"<td class='num'>{esess['command_count']} ({esess['failed_command_count']})</td>"
+            f"<td class='num'>{sub_toggle}</td>"
+            f"<td class='num'>{stok['uncached_input_tokens']:,}</td>"
+            f"<td class='num'>{stok['cached_input_tokens']:,}</td>"
+            f"<td class='num'>{stok['billed_output_tokens']:,}</td>"
+            f"<td class='num'>{cost_str}</td>"
+            f"</tr>"
+        )
+        if esess.get("subagents"):
+            sub_items = []
+            for sub in esess["subagents"]:
+                sub_tok = sub["token_usage"]
+                sub_model = sub.get("model") or "—"
+                if sub.get("reasoning_effort"):
+                    sub_model = f"{sub_model} ({sub['reasoning_effort']})"
+                nick = (
+                    f" ({html.escape(sub['agent_nickname'])})"
+                    if sub.get("agent_nickname")
+                    else ""
+                )
+                sub_items.append(
+                    f"<tr>"
+                    f"<td><code>depth {sub.get('depth', 1)}</code></td>"
+                    f"<td><code>{html.escape(str(sub.get('agent_role') or 'default'))}</code>{nick}</td>"
+                    f"<td><code>{html.escape(str(sub['thread_id'])[:12])}</code></td>"
+                    f"<td><code>{html.escape(sub_model)}</code></td>"
+                    f"<td class='num'>{sub['command_count']} ({sub['failed_command_count']})</td>"
+                    f"<td class='num'>{sub_tok['uncached_input_tokens']:,}</td>"
+                    f"<td class='num'>{sub_tok['cached_input_tokens']:,}</td>"
+                    f"<td class='num'>{sub_tok['billed_output_tokens']:,}</td>"
+                    f"<td class='num'>{html.escape(format_cost(sub.get('est_cost')))}</td>"
+                    f"</tr>"
+                )
+            eval_session_rows_html.append(
+                f"<tr id='eval-sub-{idx}' class='subagent-drawer' style='display:none'>"
+                f"<td colspan='13'>"
+                f"<div class='subagent-box'>"
+                f"<strong>Spawned eval trial subagents (worker tokens: "
+                f"{esess['parent_token_usage']['billed_output_tokens']:,} billed out, "
+                f"subagent tokens: {esess['subagent_token_usage']['billed_output_tokens']:,} billed out)</strong>"
+                f"<table class='sub-table'>"
+                f"<thead><tr><th>Depth</th><th>Role</th><th>Thread ID</th><th>Model</th>"
+                f"<th class='num'>Cmds (fail)</th><th class='num'>Uncached in</th>"
+                f"<th class='num'>Cached in</th><th class='num'>Billed out</th><th class='num'>Est. cost</th></tr></thead>"
+                f"<tbody>{''.join(sub_items)}</tbody></table></div></td></tr>"
+            )
+    if not eval_session_rows_html:
+        eval_session_rows_html.append(
+            "<tr><td colspan='13' class='empty'>No harness eval trial sessions recorded yet.</td></tr>"
         )
 
     skill_opt_html = "".join(
@@ -1216,8 +2140,15 @@ def render_usage_html(summary: dict[str, Any]) -> str:
         f"<option value='{html.escape(m)}'>{html.escape(m)}</option>"
         for m in all_model_options
     )
+    eval_skill_opt_html = "".join(
+        f"<option value='{html.escape(s)}'>{html.escape(s)}</option>"
+        for s in eval_skill_options
+    )
 
-    return f"""<!DOCTYPE html>
+    real_status_cls = "ok" if totals["session_count"] > 0 else "neutral"
+    eval_status_cls = "info" if etotals["total_call_count"] > 0 else "neutral"
+
+    return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1225,283 +2156,558 @@ def render_usage_html(summary: dict[str, Any]) -> str:
 <title>Codex Usage — {project_name}</title>
 <style>
   :root {{
-    --bg: #0f172a;
-    --panel: #1e293b;
-    --panel-alt: #162032;
-    --border: #334155;
-    --text: #f1f5f9;
-    --muted: #94a3b8;
-    --accent: #38bdf8;
-    --ok: #22c55e;
-    --warn: #f59e0b;
+    color-scheme: light;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f6f8fb;
+    color: #172033;
   }}
   * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    padding: 24px 32px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    line-height: 1.5;
-  }}
-  header {{
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    flex-wrap: wrap;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 16px;
-    margin-bottom: 24px;
-  }}
-  h1 {{ margin: 0; font-size: 1.5rem; }}
-  h2 {{ margin: 28px 0 12px; font-size: 1.15rem; color: var(--text); }}
-  .meta {{ color: var(--muted); font-size: 0.875rem; }}
-  .cards {{
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
-    gap: 14px;
-    margin-bottom: 24px;
-  }}
-  .card {{
-    background: var(--panel);
-    border: 1px solid var(--border);
+  body {{ margin: 0; background: #f6f8fb; color: #172033; line-height: 1.5; }}
+  main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+  header, section, .round, .event {{
+    background: #fbfdff;
+    border: 1px solid #dbe3ef;
     border-radius: 8px;
-    padding: 14px 16px;
   }}
-  .card-label {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-  .card-val {{ font-size: 1.45rem; font-weight: 600; margin-top: 4px; }}
-  .card-sub {{ color: var(--muted); font-size: 0.8rem; margin-top: 2px; }}
-  .note {{
-    background: var(--panel-alt);
-    border-left: 3px solid var(--accent);
-    padding: 10px 14px;
-    font-size: 0.85rem;
-    color: var(--muted);
-    margin-bottom: 24px;
-    border-radius: 4px;
+  header, section {{ padding: 18px 20px; margin-bottom: 18px; }}
+  h1, h2, h3, h4 {{ margin: 0 0 8px; }}
+  h1 {{ font-size: 24px; }}
+  h2 {{ font-size: 16px; }}
+  h3 {{ font-size: 13px; }}
+  h4 {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #475569; margin: 0 0 8px; }}
+  p {{ margin: 6px 0; }}
+  .muted {{ color: #5b677d; font-size: 13px; }}
+  .metrics {{
+    display: grid;
+    grid-template-columns: repeat(5, minmax(120px, 1fr));
+    gap: 10px;
+    margin-top: 16px;
   }}
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-    background: var(--panel);
-    border: 1px solid var(--border);
+  @media (max-width: 860px) {{
+    .metrics {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
+  }}
+  .metric {{
+    background: #eef4fb;
+    border: 1px solid #dbe3ef;
+    border-radius: 8px;
+    padding: 12px;
+  }}
+  .metric strong {{ display: block; font-size: 20px; margin-top: 4px; font-variant-numeric: tabular-nums; }}
+  .metric span {{ color: #5b677d; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }}
+  .metric small {{ display: block; margin-top: 4px; font-size: 11px; opacity: 0.85; }}
+  .pill {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }}
+  .ok {{ background: #dcfce7; color: #166534; border-color: #bbf7d0; }}
+  .warn {{ background: #fef3c7; color: #92400e; border-color: #fde68a; }}
+  .bad {{ background: #fee2e2; color: #991b1b; border-color: #fecaca; }}
+  .info {{ background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }}
+  .neutral {{ background: #e2e8f0; color: #334155; border-color: #cbd5e1; }}
+  .metric.ok span, .metric.ok small {{ color: #166534; }}
+  .metric.warn span, .metric.warn small {{ color: #92400e; }}
+  .metric.bad span, .metric.bad small {{ color: #991b1b; }}
+  .metric.info span, .metric.info small {{ color: #1e40af; }}
+  .metric.neutral span, .metric.neutral small {{ color: #334155; }}
+  .summary-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(280px, 1fr));
+    gap: 14px;
+    margin-top: 16px;
+  }}
+  @media (max-width: 860px) {{
+    .summary-grid {{ grid-template-columns: 1fr; }}
+  }}
+  .summary-panel {{
+    background: #ffffff;
+    border: 1px solid #dbe3ef;
     border-radius: 8px;
     overflow: hidden;
-    font-size: 0.875rem;
   }}
-  th, td {{
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-    vertical-align: top;
+  .summary-panel h3 {{
+    margin: 0;
+    padding: 10px 14px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    background: #172033;
+    color: #f8fafc;
   }}
-  th {{
-    background: var(--panel-alt);
-    color: var(--muted);
-    font-weight: 600;
-    font-size: 0.78rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
+  .summary-panel-body {{ padding: 14px; }}
+  .round {{ margin-bottom: 18px; overflow: hidden; }}
+  .round-head {{
+    padding: 12px 16px;
+    background: #172033;
+    color: #f8fafc;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
   }}
+  .round-head::-webkit-details-marker {{ display: none; }}
+  .round-head h2 {{ display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; }}
+  .round-head h2::before {{
+    content: "›";
+    display: inline-block;
+    font-size: 18px;
+    line-height: 1;
+    transition: transform 0.15s ease;
+  }}
+  details.round[open] > .round-head h2::before {{ transform: rotate(90deg); }}
+  .round-head span {{ color: #cbd5e1; font-size: 12px; }}
+  .events {{ padding: 14px; display: grid; gap: 14px; background: #f6f8fb; }}
+  .event {{ padding: 14px 16px; background: #fbfdff; }}
+  .event-head {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; background: #fff; border: 1px solid #dbe3ef; border-radius: 6px; overflow: hidden; }}
+  th, td {{ border-bottom: 1px solid #e5e7eb; padding: 8px 10px; vertical-align: top; text-align: left; }}
+  th {{ background: #eef4fb; color: #475569; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }}
   th.num, td.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
   tr:last-child td {{ border-bottom: none; }}
   code {{
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.82rem;
-    background: rgba(148, 163, 184, 0.12);
+    font-size: 11px;
+    background: #eef4fb;
+    color: #1e293b;
     padding: 2px 5px;
     border-radius: 4px;
+    border: 1px solid #dbe3ef;
   }}
-  .badge {{
-    display: inline-block;
-    padding: 1px 7px;
-    border-radius: 999px;
-    font-size: 0.75rem;
-    font-weight: 500;
-  }}
-  .badge-ok {{ background: rgba(34, 197, 94, 0.16); color: #4ade80; }}
-  .badge-warn {{ background: rgba(245, 158, 11, 0.18); color: #fbbf24; }}
-  .badge-muted {{ background: rgba(148, 163, 184, 0.15); color: var(--muted); }}
-  .badge-skill {{ background: rgba(56, 189, 248, 0.16); color: var(--accent); margin-right: 4px; }}
   .bar-cell {{ display: flex; align-items: center; justify-content: flex-end; gap: 8px; }}
-  .bar-track {{ width: 64px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }}
-  .bar-fill {{ height: 100%; background: var(--accent); }}
+  .bar-track {{ width: 64px; height: 6px; background: #dbe3ef; border-radius: 3px; overflow: hidden; }}
+  .bar-fill {{ height: 100%; background: #2563eb; }}
   .filters {{
     display: flex;
-    gap: 12px;
-    margin-bottom: 12px;
+    gap: 10px;
+    margin: 8px 0 10px;
     flex-wrap: wrap;
   }}
   .filters input, .filters select {{
-    background: var(--panel);
-    color: var(--text);
-    border: 1px solid var(--border);
+    background: #ffffff;
+    color: #172033;
+    border: 1px solid #cbd5e1;
     border-radius: 6px;
-    padding: 7px 11px;
-    font-size: 0.875rem;
+    padding: 6px 10px;
+    font-size: 12px;
   }}
   .filters input {{ min-width: 240px; }}
   .btn-expand {{
-    background: rgba(56, 189, 248, 0.14);
-    color: var(--accent);
-    border: 1px solid rgba(56, 189, 248, 0.35);
+    background: #eef4fb;
+    color: #1e40af;
+    border: 1px solid #bfdbfe;
     border-radius: 4px;
     padding: 2px 8px;
     cursor: pointer;
-    font-size: 0.78rem;
+    font-size: 11px;
+    font-weight: 600;
   }}
+  .btn-expand:hover {{ background: #dbeafe; }}
   .subagent-box {{
-    background: var(--panel-alt);
-    padding: 10px 14px;
+    background: #f8fafc;
+    border: 1px solid #dbe3ef;
+    padding: 10px 12px;
     border-radius: 6px;
   }}
   .sub-table {{ margin-top: 8px; }}
-  .prompt-cell {{ max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }}
-  .empty {{ text-align: center; color: var(--muted); padding: 20px; }}
-  .muted {{ color: var(--muted); }}
+  .prompt-cell {{ max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5b677d; }}
+  .empty {{ text-align: center; color: #5b677d; padding: 18px; }}
+  .note-box {{
+    margin-top: 14px;
+    padding: 10px 12px;
+    background: #eef4fb;
+    border: 1px solid #dbe3ef;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #334155;
+  }}
 </style>
 </head>
 <body>
-<header>
-  <div>
-    <h1>Codex Project Usage: {project_name}</h1>
-    <div class="meta">Project root: <code>{project_root}</code></div>
-  </div>
-  <div class="meta">Updated: <code>{generated_at}</code></div>
-</header>
+<main>
+  <header>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
+      <div>
+        <h1>Codex Project Usage: {project_name}</h1>
+        <p class="muted">Project root: <code>{project_root}</code> · Updated: <code>{generated_at}</code></p>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span class="pill {real_status_cls}">{totals['session_count']} real session(s)</span>
+        <span class="pill {eval_status_cls}">{etotals['total_call_count']} eval call(s)</span>
+      </div>
+    </div>
 
-<div class="cards">
-  <div class="card">
-    <div class="card-label">Real Sessions</div>
-    <div class="card-val">{totals['session_count']}</div>
-    <div class="card-sub">{totals['turn_count']} total turns</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Uncached Input</div>
-    <div class="card-val">{tok['uncached_input_tokens']:,}</div>
-    <div class="card-sub">Billed at full input rate</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Cached Input</div>
-    <div class="card-val">{tok['cached_input_tokens']:,}</div>
-    <div class="card-sub">{totals['cache_hit_pct']}% cache hit rate</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Billed Output</div>
-    <div class="card-val">{tok['billed_output_tokens']:,}</div>
-    <div class="card-sub">{tok['output_tokens']:,} out + {tok['reasoning_output_tokens']:,} reasoning</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Subagent Spawns</div>
-    <div class="card-val">{totals['subagent_spawn_count']}</div>
-    <div class="card-sub">{totals['command_count']} cmds ({totals['failed_command_count']} failed)</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Est. API Cost</div>
-    <div class="card-val">{html.escape(total_cost_str)}</div>
-    <div class="card-sub">API-equivalent estimate</div>
-  </div>
-</div>
+    <div class="metrics">
+      <div class="metric {real_status_cls}">
+        <span>Real Project Work</span>
+        <strong>{totals['session_count']}</strong>
+        <small>{totals['turn_count']} turns · {totals['subagent_spawn_count']} subagents</small>
+      </div>
+      <div class="metric {eval_status_cls}">
+        <span>Harness Eval Calls</span>
+        <strong>{etotals['total_call_count']}</strong>
+        <small>{etotals['worker_session_count']} trials · {etotals['subagent_spawn_count']} subagents · {etotals['judge_call_count']} judges</small>
+      </div>
+      <div class="metric neutral">
+        <span>Real Billed Output</span>
+        <strong>{tok['billed_output_tokens']:,}</strong>
+        <small>{totals['cache_hit_pct']}% cache hit · {tok['uncached_input_tokens']:,} uncached in</small>
+      </div>
+      <div class="metric neutral">
+        <span>Eval Billed Output</span>
+        <strong>{etok['billed_output_tokens']:,}</strong>
+        <small>{etotals['cache_hit_pct']}% cache hit · {etok['uncached_input_tokens']:,} uncached in</small>
+      </div>
+      <div class="metric warn">
+        <span>Est. API Cost (Split)</span>
+        <strong>{html.escape(combined_cost_str)}</strong>
+        <small>Real: {html.escape(total_cost_str)} · Eval: {html.escape(eval_cost_str)}</small>
+      </div>
+    </div>
 
-<div class="note">
-  <strong>Zero-token telemetry:</strong> Computed directly from local <code>~/.codex/sessions/</code> rollouts scoped to this project root (excluding synthetic <code>eval.py run</code> sandbox trials). <code>Est. API cost</code> uses public OpenAI API list prices as of {html.escape(PRICING_AS_OF)} and is not actual subscription spend.
-</div>
+    <div class="summary-grid">
+      <div class="summary-panel">
+        <h3>
+          <span>1. Real Project Work</span>
+          <span class="pill {real_status_cls}">{html.escape(total_cost_str)} est.</span>
+        </h3>
+        <div class="summary-panel-body">
+          <p class="muted" style="margin-top:0;">Interactive &amp; background Codex sessions working in <code>{project_name}</code> (excluding <code>eval.py run</code> trials).</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th class="num">Root Sessions</th>
+                <th class="num">Subagents</th>
+                <th class="num">Combined</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Count / Spawns</td>
+                <td class="num">{totals['session_count']}</td>
+                <td class="num">{totals['subagent_spawn_count']}</td>
+                <td class="num"><strong>{totals['session_count'] + totals['subagent_spawn_count']}</strong></td>
+              </tr>
+              <tr>
+                <td>Uncached Input</td>
+                <td class="num">{totals['parent_tokens']['uncached_input_tokens']:,}</td>
+                <td class="num">{totals['subagent_tokens']['uncached_input_tokens']:,}</td>
+                <td class="num">{tok['uncached_input_tokens']:,}</td>
+              </tr>
+              <tr>
+                <td>Cached Input</td>
+                <td class="num">{totals['parent_tokens']['cached_input_tokens']:,}</td>
+                <td class="num">{totals['subagent_tokens']['cached_input_tokens']:,}</td>
+                <td class="num">{tok['cached_input_tokens']:,} ({totals['cache_hit_pct']}%)</td>
+              </tr>
+              <tr>
+                <td>Billed Output</td>
+                <td class="num">{totals['parent_tokens']['billed_output_tokens']:,}</td>
+                <td class="num">{totals['subagent_tokens']['billed_output_tokens']:,}</td>
+                <td class="num"><strong>{tok['billed_output_tokens']:,}</strong></td>
+              </tr>
+              <tr>
+                <td>Est. API Cost</td>
+                <td class="num">{html.escape(format_cost(totals.get('parent_est_cost')) if totals['session_count'] > 0 else '$0.0000')}</td>
+                <td class="num">{html.escape(format_cost(totals.get('subagent_est_cost')) if totals['subagent_spawn_count'] > 0 else '$0.0000')}</td>
+                <td class="num"><strong>{html.escape(total_cost_str)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
 
-<h2>Skill Usage</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Skill</th>
-      <th>Status</th>
-      <th class="num">Sessions Triggered</th>
-      <th class="num">Explicit / Implicit</th>
-      <th class="num">Uncached Input</th>
-      <th class="num">Cached Input</th>
-      <th class="num">Billed Output</th>
-      <th class="num">Est. Cost</th>
-    </tr>
-  </thead>
-  <tbody>
-    {''.join(skill_rows_html)}
-  </tbody>
-</table>
+      <div class="summary-panel">
+        <h3>
+          <span>2. Harness Eval Calls (<code>eval.py run</code>)</span>
+          <span class="pill {eval_status_cls}">{html.escape(eval_cost_str)} est.</span>
+        </h3>
+        <div class="summary-panel-body">
+          <p class="muted" style="margin-top:0;">Isolated benchmark worker trials, spawned eval subagents, and LLM semantic judge grading calls.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th class="num">Workers (+Subagents)</th>
+                <th class="num">Semantic Judges</th>
+                <th class="num">Total Eval</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Calls / Spawns</td>
+                <td class="num">{etotals['worker_session_count']} (+{etotals['subagent_spawn_count']})</td>
+                <td class="num">{etotals['judge_call_count']}</td>
+                <td class="num"><strong>{etotals['total_call_count']}</strong></td>
+              </tr>
+              <tr>
+                <td>Uncached Input</td>
+                <td class="num">{etotals['worker_tokens']['uncached_input_tokens']:,}</td>
+                <td class="num">{etotals['judge_tokens']['uncached_input_tokens']:,}</td>
+                <td class="num">{etok['uncached_input_tokens']:,}</td>
+              </tr>
+              <tr>
+                <td>Cached Input</td>
+                <td class="num">{etotals['worker_tokens']['cached_input_tokens']:,}</td>
+                <td class="num">{etotals['judge_tokens']['cached_input_tokens']:,}</td>
+                <td class="num">{etok['cached_input_tokens']:,} ({etotals['cache_hit_pct']}%)</td>
+              </tr>
+              <tr>
+                <td>Billed Output</td>
+                <td class="num">{etotals['worker_tokens']['billed_output_tokens']:,}</td>
+                <td class="num">{etotals['judge_tokens']['billed_output_tokens']:,}</td>
+                <td class="num"><strong>{etok['billed_output_tokens']:,}</strong></td>
+              </tr>
+              <tr>
+                <td>Est. API Cost</td>
+                <td class="num">{html.escape(format_cost(etotals.get('worker_est_cost')) if etotals['worker_session_count'] > 0 else '$0.0000')}</td>
+                <td class="num">{html.escape(format_cost(etotals.get('judge_est_cost')) if etotals['judge_call_count'] > 0 else '$0.0000')}</td>
+                <td class="num"><strong>{html.escape(eval_cost_str)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
 
-<h2>Subagent Usage</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Agent Role</th>
-      <th>Source</th>
-      <th class="num">Spawns</th>
-      <th class="num">Sessions Used</th>
-      <th class="num">Commands (Failed)</th>
-      <th class="num">Uncached Input</th>
-      <th class="num">Cached Input</th>
-      <th class="num">Billed Output</th>
-      <th class="num">Est. Cost</th>
-    </tr>
-  </thead>
-  <tbody>
-    {''.join(subagent_rows_html)}
-  </tbody>
-</table>
+    <div class="note-box">
+      <strong>Zero-token local telemetry:</strong> Parsed directly from <code>~/.codex/sessions/</code> and local <code>&lt;skill&gt;/runs/</code> traces. <strong>Real Project Work</strong> and <strong>Harness Eval Calls</strong> are tracked separately so benchmark runs never pollute your real project usage metrics. <code>Est. API cost</code> uses public OpenAI list prices as of {html.escape(PRICING_AS_OF)} ({html.escape(PRICING_SOURCE)}) and is not actual subscription spend.
+    </div>
+  </header>
 
-<h2>Daily Activity</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Date</th>
-      <th class="num">Sessions</th>
-      <th class="num">Turns</th>
-      <th class="num">Uncached Input</th>
-      <th class="num">Cached Input</th>
-      <th class="num">Billed Output</th>
-      <th class="num">Est. Cost</th>
-    </tr>
-  </thead>
-  <tbody>
-    {''.join(daily_rows_html)}
-  </tbody>
-</table>
+  <details class="round" open>
+    <summary class="round-head">
+      <h2>1. Real Project Work — Skills, Subagents &amp; Sessions</h2>
+      <span>{totals['session_count']} session(s) · {totals['subagent_spawn_count']} subagent(s) · {tok['billed_output_tokens']:,} billed output · {html.escape(total_cost_str)}</span>
+    </summary>
+    <div class="events">
+      <article class="event">
+        <div class="event-head">
+          <h3>Skill Usage (Real Project Work)</h3>
+          <span class="pill neutral">{len(summary['skills'])} skill(s)</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Skill</th>
+              <th>Status</th>
+              <th class="num">Sessions Triggered</th>
+              <th class="num">Explicit / Implicit</th>
+              <th class="num">Uncached Input</th>
+              <th class="num">Cached Input</th>
+              <th class="num">Billed Output</th>
+              <th class="num">Est. Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(skill_rows_html)}
+          </tbody>
+        </table>
+      </article>
 
-<h2>Session History</h2>
-<div class="filters">
-  <input type="search" id="searchInput" placeholder="Search prompt, thread ID, skill, model..." oninput="filterSessions()">
-  <select id="skillFilter" onchange="filterSessions()">
-    <option value="">All Skills</option>
-    <option value="__none__">No Skill Used</option>
-    {skill_opt_html}
-  </select>
-  <select id="modelFilter" onchange="filterSessions()">
-    <option value="">All Models</option>
-    {model_opt_html}
-  </select>
-</div>
-<table>
-  <thead>
-    <tr>
-      <th>Started (UTC)</th>
-      <th>Thread ID</th>
-      <th>Model (Effort)</th>
-      <th class="num">Turns</th>
-      <th class="num">Cmds (Fail)</th>
-      <th>Skills</th>
-      <th class="num">Subagents</th>
-      <th class="num">Uncached In</th>
-      <th class="num">Cached In</th>
-      <th class="num">Billed Out</th>
-      <th class="num">Est. Cost</th>
-      <th>First Prompt</th>
-    </tr>
-  </thead>
-  <tbody id="sessionTableBody">
-    {''.join(session_rows_html)}
-  </tbody>
-</table>
+      <article class="event">
+        <div class="event-head">
+          <h3>Subagent Usage (Real Project Work)</h3>
+          <span class="pill neutral">{totals['subagent_spawn_count']} spawn(s)</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Agent Role</th>
+              <th>Source</th>
+              <th class="num">Spawns</th>
+              <th class="num">Sessions Used</th>
+              <th class="num">Commands (Failed)</th>
+              <th class="num">Uncached Input</th>
+              <th class="num">Cached Input</th>
+              <th class="num">Billed Output</th>
+              <th class="num">Est. Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(subagent_rows_html)}
+          </tbody>
+        </table>
+      </article>
+
+      <article class="event">
+        <div class="event-head">
+          <h3>Daily Activity (Real Project Work)</h3>
+          <span class="pill neutral">{len(summary['daily'])} day(s)</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th class="num">Sessions</th>
+              <th class="num">Turns</th>
+              <th class="num">Uncached Input</th>
+              <th class="num">Cached Input</th>
+              <th class="num">Billed Output</th>
+              <th class="num">Est. Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(daily_rows_html)}
+          </tbody>
+        </table>
+      </article>
+
+      <article class="event">
+        <div class="event-head">
+          <h3>Session History (Real Project Work)</h3>
+          <span class="pill neutral">{len(summary['sessions'])} session(s)</span>
+        </div>
+        <div class="filters">
+          <input type="search" id="searchInput" placeholder="Search prompt, thread ID, skill, model..." oninput="filterSessions()">
+          <select id="skillFilter" onchange="filterSessions()">
+            <option value="">All Skills</option>
+            <option value="__none__">No Skill Used</option>
+            {skill_opt_html}
+          </select>
+          <select id="modelFilter" onchange="filterSessions()">
+            <option value="">All Models</option>
+            {model_opt_html}
+          </select>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Started (UTC)</th>
+              <th>Thread ID</th>
+              <th>Model (Effort)</th>
+              <th class="num">Turns</th>
+              <th class="num">Cmds (Fail)</th>
+              <th>Skills</th>
+              <th class="num">Subagents</th>
+              <th class="num">Uncached In</th>
+              <th class="num">Cached In</th>
+              <th class="num">Billed Out</th>
+              <th class="num">Est. Cost</th>
+              <th>First Prompt</th>
+            </tr>
+          </thead>
+          <tbody id="sessionTableBody">
+            {''.join(session_rows_html)}
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </details>
+
+  <details class="round" open>
+    <summary class="round-head">
+      <h2>2. Harness Eval Calls — Benchmark Workers, Eval Subagents &amp; Semantic Judges</h2>
+      <span>{etotals['worker_session_count']} worker trial(s) · {etotals['subagent_spawn_count']} subagent(s) · {etotals['judge_call_count']} judge call(s) · {html.escape(eval_cost_str)}</span>
+    </summary>
+    <div class="events">
+      <article class="event">
+        <div class="event-head">
+          <h3>Harness Eval Usage by Evaluated Skill</h3>
+          <span class="pill info">{len(harness_evals['by_skill'])} evaluated skill(s)</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Evaluated Skill</th>
+              <th>Experiments</th>
+              <th class="num">Worker Trials</th>
+              <th class="num">Eval Subagents</th>
+              <th class="num">Judge Calls</th>
+              <th class="num">Uncached In</th>
+              <th class="num">Cached In</th>
+              <th class="num">Worker Billed Out</th>
+              <th class="num">Judge Billed Out</th>
+              <th class="num">Worker Cost</th>
+              <th class="num">Judge Cost</th>
+              <th class="num">Total Eval Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(eval_skill_rows_html)}
+          </tbody>
+        </table>
+      </article>
+
+      <article class="event">
+        <div class="event-head">
+          <h3>Subagent Usage Inside Harness Eval Trials</h3>
+          <span class="pill neutral">{etotals['subagent_spawn_count']} eval spawn(s)</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Agent Role</th>
+              <th>Source</th>
+              <th class="num">Spawns</th>
+              <th class="num">Trials Used</th>
+              <th class="num">Commands (Failed)</th>
+              <th class="num">Uncached Input</th>
+              <th class="num">Cached Input</th>
+              <th class="num">Billed Output</th>
+              <th class="num">Est. Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(eval_subagent_rows_html)}
+          </tbody>
+        </table>
+      </article>
+
+      <article class="event">
+        <div class="event-head">
+          <h3>Harness Eval Worker Trial Sessions</h3>
+          <span class="pill neutral">{len(harness_evals['sessions'])} trial session(s)</span>
+        </div>
+        <div class="filters">
+          <input type="search" id="evalSearchInput" placeholder="Search skill, experiment, case, model..." oninput="filterEvalSessions()">
+          <select id="evalSkillFilter" onchange="filterEvalSessions()">
+            <option value="">All Evaluated Skills</option>
+            {eval_skill_opt_html}
+          </select>
+          <select id="evalConfigFilter" onchange="filterEvalSessions()">
+            <option value="">All Configs</option>
+            <option value="with-skill">with-skill</option>
+            <option value="baseline">baseline</option>
+          </select>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Started (UTC)</th>
+              <th>Evaluated Skill</th>
+              <th>Experiment</th>
+              <th>Case / Trial</th>
+              <th>Config</th>
+              <th>Model (Effort)</th>
+              <th class="num">Turns</th>
+              <th class="num">Cmds (Fail)</th>
+              <th class="num">Subagents</th>
+              <th class="num">Uncached In</th>
+              <th class="num">Cached In</th>
+              <th class="num">Billed Out</th>
+              <th class="num">Est. Cost</th>
+            </tr>
+          </thead>
+          <tbody id="evalSessionTableBody">
+            {''.join(eval_session_rows_html)}
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </details>
+</main>
 
 <script>
-function toggleSub(idx) {{
-  const row = document.getElementById('sub-' + idx);
+function toggleSub(rowId) {{
+  const row = document.getElementById(rowId);
   if (!row) return;
   row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
 }}
@@ -1520,6 +2726,22 @@ function filterSessions() {{
     const matchModel = !md || rowModel === md;
     const matchSearch = !q || rowSearch.includes(q);
     const show = matchSkill && matchModel && matchSearch;
+    row.style.display = show ? '' : 'none';
+  }});
+}}
+function filterEvalSessions() {{
+  const q = (document.getElementById('evalSearchInput').value || '').toLowerCase();
+  const sk = document.getElementById('evalSkillFilter').value;
+  const cfg = document.getElementById('evalConfigFilter').value;
+  const rows = document.querySelectorAll('.eval-session-row');
+  rows.forEach((row) => {{
+    const rowSkill = row.getAttribute('data-skill') || '';
+    const rowCfg = row.getAttribute('data-config') || '';
+    const rowSearch = row.getAttribute('data-search') || '';
+    const matchSkill = !sk || rowSkill === sk;
+    const matchCfg = !cfg || rowCfg === cfg;
+    const matchSearch = !q || rowSearch.includes(q);
+    const show = matchSkill && matchCfg && matchSearch;
     row.style.display = show ? '' : 'none';
   }});
 }}
@@ -1575,11 +2797,16 @@ def generate_usage_report(
     write_json(summary_json, summary)
 
     totals = summary["totals"]
+    eval_totals = summary["harness_evals"]["totals"]
     return {
         "skipped": False,
         "summary": summary,
         "session_count": totals["session_count"],
         "subagent_count": totals["subagent_spawn_count"],
+        "eval_worker_count": eval_totals["worker_session_count"],
+        "eval_subagent_count": eval_totals["subagent_spawn_count"],
+        "eval_judge_count": eval_totals["judge_call_count"],
+        "eval_call_count": eval_totals["total_call_count"],
         "report_md": report_md,
         "report_html": report_html,
         "summary_json": summary_json,

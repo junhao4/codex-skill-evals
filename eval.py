@@ -10,8 +10,6 @@ from pathlib import Path
 
 
 EVALS_ROOT = Path(__file__).resolve().parent
-AGENTS_ROOT = EVALS_ROOT.parent
-SKILLS_ROOT = AGENTS_ROOT / "skills"
 LIB_ROOT = EVALS_ROOT / "_lib"
 SCHEMA = LIB_ROOT / "grade.schema.json"
 DEFAULT_TIMEOUT_SECONDS = 600
@@ -437,6 +435,11 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     experiment["status"] = "completed"
     experiment["completed_at"] = now()
     aggregates, report = finalize_experiment(experiment_root, experiment, results)
+    if (EVALS_ROOT / "_usage").is_dir():
+        try:
+            generate_usage_report(evals_root=EVALS_ROOT)
+        except Exception:
+            pass
     if aggregates["comparisons"]:
         print("\nBaseline comparison:")
         for test_case_name, comparison in aggregates["comparisons"].items():
@@ -476,8 +479,14 @@ def setup_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     else:
         print("Codex notify hook: skipped (--no-notify)")
     print(
-        f"Project sessions tracked: {result['session_count']} "
+        f"Real project sessions tracked: {result['session_count']} "
         f"({result['subagent_count']} subagent spawn(s))"
+    )
+    print(
+        f"Harness eval calls tracked: {result.get('eval_call_count', 0)} "
+        f"({result.get('eval_worker_count', 0)} worker trial(s), "
+        f"{result.get('eval_subagent_count', 0)} eval subagent(s), "
+        f"{result.get('eval_judge_count', 0)} semantic judge(s))"
     )
     print(f"HTML report: {result['html_path']}")
     print(f"Markdown report: {result['markdown_path']}")
@@ -504,8 +513,12 @@ def run_usage(args: argparse.Namespace) -> int:
         print(f"Usage report skipped ({result.get('reason', 'not applicable')}).")
         return 0
     print(
-        f"Project usage updated: {result['session_count']} session(s), "
-        f"{result['subagent_count']} subagent spawn(s)"
+        f"Project usage updated: {result['session_count']} real session(s) "
+        f"(+{result['subagent_count']} subagent(s)), "
+        f"{result.get('eval_call_count', 0)} harness eval call(s) "
+        f"({result.get('eval_worker_count', 0)} worker, "
+        f"{result.get('eval_subagent_count', 0)} subagent, "
+        f"{result.get('eval_judge_count', 0)} judge)"
     )
     print(f"HTML report: {result['html_path']}")
     print(f"Markdown report: {result['markdown_path']}")

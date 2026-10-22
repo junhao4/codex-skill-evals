@@ -371,8 +371,8 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
         ],
     )
 
-    # 3. Synthetic eval.py run trial workspace session -> MUST BE EXCLUDED
-    trial_ws = (
+    # 3. Synthetic eval.py run trial workspace session -> SPLIT INTO HARNESS EVALS (NOT real project work)
+    trial_dir = (
         evals_root
         / "code-review"
         / "runs"
@@ -381,8 +381,8 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
         / "case-1"
         / "with-skill"
         / "trial-01"
-        / "workspace"
     )
+    trial_ws = trial_dir / "workspace"
     _write_rollout(
         sessions_root / "2026" / "04" / "20" / "rollout-eval-trial.jsonl",
         [
@@ -397,18 +397,44 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
                 },
             },
             {
+                "timestamp": "2026-04-20T11:00:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": str(trial_ws),
+                    "model": "gpt-5.4",
+                    "effort": "high",
+                },
+            },
+            {
                 "timestamp": "2026-04-20T11:00:05Z",
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
                     "info": {
                         "total_token_usage": {
-                            "input_tokens": 999999,
-                            "cached_input_tokens": 0,
-                            "output_tokens": 99999,
-                            "reasoning_output_tokens": 0,
+                            "input_tokens": 9000,
+                            "cached_input_tokens": 1000,
+                            "output_tokens": 900,
+                            "reasoning_output_tokens": 100,
                         }
                     },
+                },
+            },
+        ],
+    )
+    # Also write a semantic judge trace in the trial's grades directory
+    judge_trace = trial_dir / "grades" / "semantic" / "judge-01" / "trace.jsonl"
+    _write_rollout(
+        judge_trace,
+        [
+            {"type": "thread.started", "thread_id": "judge-thread-01"},
+            {"type": "turn.started"},
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 3000,
+                    "cached_input_tokens": 1000,
+                    "output_tokens": 400,
                 },
             },
         ],
@@ -445,7 +471,7 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
         evals_root=evals_root,
     )
 
-    # Only 1 top-level project session should be included (with 1 linked subagent)
+    # Only 1 top-level real project session should be included in `totals` (with 1 linked subagent)
     assert summary["totals"]["session_count"] == 1
     assert summary["totals"]["subagent_spawn_count"] == 1
     # Token usage rolls up parent (4000 uncached + 1000 cached + 600 billed output)
@@ -457,6 +483,21 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
     assert tok["reasoning_output_tokens"] == 150
     assert tok["billed_output_tokens"] == 850
     assert summary["totals"]["est_cost"] > 0
+
+    # Harness eval calls are tracked separately in `harness_evals`
+    hevals = summary["harness_evals"]
+    assert hevals["totals"]["worker_session_count"] == 1
+    assert hevals["totals"]["judge_call_count"] == 1
+    assert hevals["totals"]["total_call_count"] == 2
+    assert hevals["totals"]["worker_tokens"]["uncached_input_tokens"] == 8000
+    assert hevals["totals"]["worker_tokens"]["billed_output_tokens"] == 1000
+    assert hevals["totals"]["judge_tokens"]["uncached_input_tokens"] == 2000
+    assert hevals["totals"]["judge_tokens"]["billed_output_tokens"] == 400
+    assert hevals["totals"]["tokens"]["billed_output_tokens"] == 1400
+    assert len(hevals["by_skill"]) == 1
+    assert hevals["by_skill"][0]["skill"] == "code-review"
+    assert hevals["by_skill"][0]["worker_trials"] == 1
+    assert hevals["by_skill"][0]["judge_calls"] == 1
 
     # Installed skills include both used (code-review) and unused (unused-skill)
     skills_by_name = {s["skill"]: s for s in summary["skills"]}
@@ -474,11 +515,17 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
     # Render Markdown and HTML and verify key sections exist
     md = render_usage_markdown(summary)
     assert "# Project usage report:" in md
+    assert "Real Project Work" in md
+    assert "Harness Eval Calls" in md
     assert "`unused-skill`" in md
     assert "`security-reviewer`" in md
 
     html = render_usage_html(summary)
-    assert "<!DOCTYPE html>" in html
+    assert "<!doctype html>" in html.lower()
+    assert "color-scheme: light;" in html
+    assert "#f6f8fb" in html
+    assert "Real Project Work" in html
+    assert "Harness Eval Calls" in html
     assert "unused-skill" in html
     assert "security-reviewer" in html
 
@@ -571,4 +618,26 @@ def test_setup_and_usage_cli_end_to_end(tmp_path):
         check=True,
     )
     assert proc.stdout == ""
+
+
+import tempfile  # noqa: E402
+import unittest  # noqa: E402
+
+
+class UsageTests(unittest.TestCase):
+    def test_all_usage_scenarios(self):
+        for fn in (
+            test_resolve_project_root_and_cwd_scoping,
+            test_configure_codex_notify_creates_and_preserves_valid_toml,
+            test_parse_session_rollout_extracts_skills_tokens_and_subagents,
+            test_build_project_usage_scopes_sessions_and_rolls_up_subagents,
+            test_setup_and_usage_cli_end_to_end,
+        ):
+            with self.subTest(test=fn.__name__), tempfile.TemporaryDirectory() as tmp:
+                fn(Path(tmp))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
 
