@@ -44,6 +44,7 @@ from _lib.git_workspace import (  # noqa: E402, F401
     remove_workspace_git_metadata,
     require_clean_repository,
     untracked_paths,
+    validate_fixture,
 )
 from _lib.grading import (  # noqa: E402, F401
     ABSTAIN_VERDICT,
@@ -114,17 +115,7 @@ def discover_cases(eval_root: Path, skill_root: Path) -> dict[str, Case]:
             raise HarnessError(f"test case {root.name} is missing prompt.md")
         if not fixture.is_dir():
             raise HarnessError(f"test case {root.name} is missing fixture/")
-        if (fixture / ".git").exists():
-            raise HarnessError(
-                f"test case {root.name} fixture must not contain .git; "
-                "the harness creates disposable Git history"
-            )
-        if (fixture / ".agents").exists():
-            raise HarnessError(
-                f"test case {root.name} fixture must not contain .agents"
-            )
-        if (fixture / ".codex").exists():
-            raise HarnessError(f"test case {root.name} fixture must not contain .codex; declare agent-profiles.json")
+        validate_fixture(fixture)
         if not expected.is_file() and not checker.is_file():
             raise HarnessError(
                 f"test case {root.name} needs expected.md, check.py, or both"
@@ -212,6 +203,7 @@ def run_trial(
 ) -> dict[str, Any]:
     if run_dir.exists():
         raise HarnessError(f"refusing to overwrite run: {run_dir}")
+    validate_fixture(case.fixture)
     run_dir.mkdir(parents=True)
     workspace = run_dir / "workspace"
     worker_dir = run_dir / "worker"
@@ -219,6 +211,7 @@ def run_trial(
 
     print("  [1/7] Copying the case-local fixture", flush=True)
     shutil.copytree(case.fixture, workspace, symlinks=True)
+    validate_fixture(workspace)
     fixture_sha256 = directory_digest(case.fixture)
     fixture_revision = initialize_fixture_repository(workspace)
 

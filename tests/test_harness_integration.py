@@ -281,3 +281,53 @@ def test_regrade_preserves_retained_checker_decision(trial_case, monkeypatch, de
     result = harness.regrade_with_semantic(case=case, run_dir=run_dir, schema=SCHEMA,
                                          timeout=10, model=None, judge_count=1)
     assert result['overall_pass'] is expected_pass
+
+
+@pytest.mark.parametrize('kind', ['external-file', 'external-dir', 'absolute-internal', 'relative-internal', 'dangling'])
+def test_fixture_symlinks_are_rejected_before_copy_or_execution(trial_case, monkeypatch, kind):
+    case, skill, run_dir = trial_case
+    outside = run_dir.parent / 'outside'
+    outside.mkdir()
+    (outside / 'secret.txt').write_text('source must stay unchanged')
+    targets = {'external-file': outside / 'secret.txt', 'external-dir': outside,
+               'absolute-internal': case.fixture / 'source.txt',
+               'relative-internal': Path('source.txt'), 'dangling': Path('missing.txt')}
+    (case.fixture / 'link').symlink_to(targets[kind])
+    calls = simulate_worker(monkeypatch)
+    with pytest.raises(HarnessError, match='symlink'):
+        harness.discover_cases(case.root.parents[1], skill)
+    with pytest.raises(HarnessError, match='symlink'):
+        run_case(trial_case)
+    assert not run_dir.exists()
+    assert not calls
+    assert (outside / 'secret.txt').read_text() == 'source must stay unchanged'
+
+
+
+
+
+
+
+
+
+def test_nested_fixture_directory_link_is_rejected(trial_case, monkeypatch):
+    case, _, run_dir = trial_case
+    nested = case.fixture / 'nested'
+    nested.mkdir()
+    (nested / 'cycle').symlink_to('..')
+    simulate_worker(monkeypatch)
+    with pytest.raises(HarnessError, match='symlink'):
+        run_case(trial_case)
+    assert not run_dir.exists()
+
+
+def test_fixture_root_symlink_is_rejected(trial_case, monkeypatch):
+    case, skill, run_dir = trial_case
+    alias = case.root / 'fixture-alias'
+    alias.symlink_to(case.fixture)
+    linked_case = Case(case.name, case.root, alias, case.prompt, case.expected,
+                       case.checker, case.supporting_skills, case.interactions, case.agent_profiles)
+    simulate_worker(monkeypatch)
+    with pytest.raises(HarnessError, match='symlink'):
+        run_case((linked_case, skill, run_dir))
+    assert not run_dir.exists()

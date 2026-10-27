@@ -41,6 +41,13 @@ never the original fixture.
 | It does not contain `.git/` | The fixture remains an ordinary directory that the main project can track; the harness creates Git history in each disposable copy |
 | It does not contain `.agents/` or `.codex/` | The harness controls injected skills and declared agent profiles; private evaluator files remain outside the workspace |
 
+Fixture directories must not contain symlinks, including relative internal,
+absolute, directory, dangling, and cyclic links. The harness checks during case
+discovery and immediately before execution, then validates the copied fixture
+before initializing Git. Use ordinary files/directories in fixtures. This
+conservative rule avoids retaining links back to the original project; it does
+not establish isolation against concurrent source mutation or malicious workers.
+
 Different test cases may—and usually should—use different fixture directories.
 
 After copying the fixture, the harness initializes a temporary Git repository

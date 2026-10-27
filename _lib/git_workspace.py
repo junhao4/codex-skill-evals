@@ -39,6 +39,24 @@ def require_clean_repository(repository: Path, label: str) -> str:
     return revision.stdout.strip()
 
 
+def validate_fixture(root: Path) -> None:
+    """Reject links instead of preserving references into the original tree.
+
+    All fixture symlinks are disallowed, including internal and dangling links.
+    This keeps validation/copy semantics small and avoids directory-link cycles.
+    """
+    if root.is_symlink():
+        raise HarnessError(f"fixture must not be a symlink: {root}")
+    if not root.is_dir():
+        raise HarnessError(f"fixture must be a directory: {root}")
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise HarnessError(f"fixture must not contain symlinks: {path}")
+    for name in (".git", ".agents", ".codex"):
+        if (root / name).exists():
+            raise HarnessError(f"fixture must not contain {name}: {root}")
+
+
 def initialize_fixture_repository(workspace: Path) -> str:
     """Create reproducible Git history around a copied plain-directory fixture."""
     initialized = git(workspace, "init", "--quiet")
