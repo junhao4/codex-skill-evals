@@ -144,3 +144,5 @@ keep this README focused on getting started:
   jury decides pass/fail.
 - [Evaluation outputs](docs/outputs.md) — reference for every file written
   under `runs/`, `comparisons/`, and `_usage/`.
+- [Testing the harness](docs/testing.md) — development test environment,
+  regression coverage, and the limits of simulated worker/judge tests.
