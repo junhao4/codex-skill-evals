@@ -25,13 +25,14 @@ from _lib.pricing import (
 from _lib.trace import (
     _collab_calls,
     _empty_token_usage,
+    _extract_collab_item,
     _extract_command_item,
     _finalize_token_usage,
     _summarize_collab_calls,
 )
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 5
 ROLLOUT_FILENAME_RE = re.compile(
     r"^rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(.+)\.jsonl$"
 )
@@ -188,6 +189,157 @@ def _extract_user_texts(event: dict[str, Any]) -> list[str]:
                 if isinstance(block, dict) and isinstance(block.get("text"), str):
                     texts.append(block["text"])
     return texts
+
+
+def _rollout_inspection(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Extract the shared Timeline and Context inputs from one retained rollout."""
+    ordered: list[dict[str, Any]] = []
+    files: dict[tuple[str, str, str], dict[str, Any]] = {}
+    tools: dict[str, int] = defaultdict(int)
+    role_chars: dict[str, int] = defaultdict(int)
+    displayed_user_texts: set[str] = set()
+    context: dict[str, Any] = {
+        "permission_profile": None, "sandbox_policy": None,
+        "approval_policy": None, "network": None, "context_window": None,
+        "base_instructions_text": "", "git_commit": None, "git_branch": None,
+        "latest_input_tokens": None, "latest_input_ts": None,
+    }
+    final_message = None
+    task_timestamps: list[str] = []
+    for event in events:
+        ts = event.get("timestamp")
+        payload = event.get("payload")
+        item = payload.get("item") if isinstance(payload, dict) else None
+        if not isinstance(item, dict):
+            item = event.get("item")
+        if not isinstance(payload, dict):
+            payload = {}
+        ptype = payload.get("type")
+        if event.get("type") == "event_msg" and ptype in ("task_started", "task_complete", "turn_aborted") and isinstance(ts, str):
+            task_timestamps.append(ts)
+
+        if event.get("type") == "session_meta":
+            meta = payload
+            base = meta.get("base_instructions")
+            if isinstance(base, dict) and isinstance(base.get("text"), str):
+                context["base_instructions_text"] = base["text"]
+                role_chars["base"] += len(base["text"])
+            git = meta.get("git")
+            if isinstance(git, dict):
+                context["git_commit"] = git.get("commit_hash") or git.get("commit")
+                context["git_branch"] = git.get("branch")
+        if event.get("type") == "turn_context":
+            tc = payload
+            context["permission_profile"] = tc.get("permission_profile") or tc.get("file_system_sandbox_policy")
+            context["sandbox_policy"] = tc.get("sandbox_policy")
+            context["approval_policy"] = tc.get("approval_policy")
+            context["network"] = (tc.get("sandbox_policy") or {}).get("network_access") if isinstance(tc.get("sandbox_policy"), dict) else None
+        if event.get("type") == "event_msg" and ptype == "task_started":
+            context["context_window"] = payload.get("model_context_window")
+        if event.get("type") == "event_msg" and ptype == "token_count":
+            info = payload.get("info")
+            if isinstance(info, dict):
+                last = info.get("last_token_usage")
+                last_input = last.get("input_tokens") if isinstance(last, dict) else None
+                if type(last_input) is int and last_input >= 0:
+                    context["latest_input_tokens"] = last_input
+                    context["latest_input_ts"] = ts
+                window = info.get("model_context_window")
+                if type(window) is int and window > 0:
+                    context["context_window"] = window
+        if event.get("type") == "event_msg" and ptype == "user_message":
+            user_text = payload.get("message")
+            if isinstance(user_text, str):
+                cleaned = _clean_user_prompt(user_text)
+                if cleaned and cleaned not in displayed_user_texts:
+                    ordered.append({"kind": "msg", "role": "user", "ts": ts, "text": cleaned[:12000]})
+                    displayed_user_texts.add(cleaned)
+        if event.get("type") == "response_item" and ptype == "message":
+            role = payload.get("role")
+            blocks = payload.get("content") if isinstance(payload.get("content"), list) else []
+            text = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and isinstance(b.get("text"), str))
+            if role in ("user", "assistant", "developer") and text.strip():
+                if role in ("user", "assistant"):
+                    shown_text = _clean_user_prompt(text) if role == "user" else text
+                    if role != "user" or shown_text not in displayed_user_texts:
+                        ordered.append({"kind": "msg", "role": role, "ts": ts, "text": shown_text[:12000]})
+                    if role == "user":
+                        displayed_user_texts.add(shown_text)
+                if role == "user":
+                    role_chars["task"] += len(_clean_user_prompt(text))
+                    env_blocks = re.findall(
+                        r"<environment_context>.*?</environment_context>", text, re.DOTALL
+                    )
+                    role_chars["environment"] += sum(len(block) for block in env_blocks)
+                elif role == "assistant":
+                    role_chars["output"] += len(text)
+                else:
+                    role_chars["skills"] += len(text)
+        if event.get("type") == "response_item" and ptype == "reasoning":
+            summary = payload.get("summary") or payload.get("summary_text") or []
+            if isinstance(summary, str):
+                summary = [summary]
+            text = "\n".join(x.get("text", "") if isinstance(x, dict) else x for x in summary if isinstance(x, (str, dict)))
+            if text.strip():
+                ordered.append({"kind": "reason", "ts": ts, "text": text[:6000]})
+        command = _extract_command_item(event)
+        if command is not None:
+            output = (item.get("stdout") or item.get("aggregated_output") or "") if isinstance(item, dict) else ""
+            parsed_cmd = item.get("parsed_cmd") if isinstance(item, dict) else None
+            ordered.append({"kind": "cmd", "ts": ts, "command": command.get("command", ""), "exit_code": command.get("exit_code"), "output": output[:4000] if isinstance(output, str) else ""})
+            if isinstance(parsed_cmd, list):
+                for op in parsed_cmd:
+                    if not isinstance(op, dict):
+                        continue
+                    op_type = op.get("type", "unknown")
+                    if op_type in ("read", "list_files"):
+                        name, path = str(op.get("name") or Path(str(op.get("path") or "")).name), str(op.get("path") or "")
+                        prior = files.get((name, path, str(op_type)), {})
+                        files[(name, path, str(op_type))] = {
+                            "name": name, "path": path, "op": op_type,
+                            "status": "missing" if "no such file" in str(output).lower() else "read",
+                            "char_len": prior.get("char_len") or (len(output) // max(1, len(parsed_cmd))) if isinstance(output, str) else 0,
+                        }
+        collab = _extract_collab_item(event)
+        if collab is not None:
+            tool = str(collab.get("tool") or "collab")
+            ordered.append({"kind": "spawn" if "spawn" in tool else "wait", "ts": ts, "tool": tool, "prompt": collab.get("prompt"), "thread_ids": collab.get("receiver_thread_ids") or []})
+        if event.get("type") == "response_item" and ptype == "custom_tool_call":
+            name = payload.get("name")
+            if isinstance(name, str):
+                tools[name] += 1
+        if event.get("type") == "event_msg" and ptype == "task_complete":
+            final_message = payload.get("last_agent_message") or final_message
+            if final_message:
+                ordered.append({"kind": "ret", "ts": ts, "text": str(final_message)[:12000]})
+
+    composition = [{"segment": key, "char_len": value, "token_estimate": round(value / 4)} for key, value in role_chars.items() if value]
+    composition.extend(
+        {"segment": "file", "name": entry["name"], "path": entry["path"], "char_len": entry["char_len"], "token_estimate": round(entry["char_len"] / 4)}
+        for entry in files.values() if entry.get("char_len") and entry.get("op") == "read" and entry.get("status") == "read"
+    )
+    # Session logs can receive settings/metadata updates hours after work ends.
+    # Measure the observed task span, excluding those later administrative records.
+    activity_timestamps = sorted(task_timestamps + [e["ts"] for e in ordered if isinstance(e.get("ts"), str)])
+    return {
+        "start_ts": activity_timestamps[0] if activity_timestamps else None,
+        "end_ts": activity_timestamps[-1] if activity_timestamps else None,
+        "events": ordered,
+        "final_message": final_message,
+        "context_window": context["context_window"],
+        "latest_input_tokens": context["latest_input_tokens"],
+        "latest_input_ts": context["latest_input_ts"],
+        "permission_profile": context["permission_profile"],
+        "sandbox_policy": context["sandbox_policy"],
+        "approval_policy": context["approval_policy"],
+        "network": context["network"],
+        "files_read": list(files.values()),
+        "tools_used": [{"name": name, "count": count} for name, count in sorted(tools.items())],
+        "composition": composition,
+        "base_instructions_text": context["base_instructions_text"],
+        "git_commit": context["git_commit"],
+        "git_branch": context["git_branch"],
+    }
 
 
 def parse_session_rollout(rollout: Path) -> dict[str, Any]:
@@ -434,6 +586,7 @@ def parse_session_rollout(rollout: Path) -> dict[str, Any]:
         cmd.get("status") == "completed" and cmd.get("exit_code") not in (None, 0)
         for cmd in commands
     )
+    inspection = _rollout_inspection(events)
 
     return {
         "thread_id": thread_id,
@@ -451,7 +604,8 @@ def parse_session_rollout(rollout: Path) -> dict[str, Any]:
         "parse_errors": parse_errors,
         "command_count": len(commands),
         "failed_command_count": failed_command_count,
-        "commands": commands[:200],
+        "commands": commands,
+        **inspection,
         "first_prompt": first_prompt,
         "explicit_skill_tokens": sorted(explicit_tokens),
         "skills_used": all_skills,
@@ -531,10 +685,6 @@ def discover_project_inventory(
 ) -> dict[str, list[str]]:
     """Return the project's installed skill names and `.codex/agents` profile names."""
     skill_dirs = [project_root / ".agents" / "skills"]
-    if evals_root is not None:
-        sibling_skills = evals_root.resolve().parent / "skills"
-        if sibling_skills not in skill_dirs:
-            skill_dirs.append(sibling_skills)
 
     installed_skills_set: set[str] = set()
     for skills_dir in skill_dirs:
@@ -587,11 +737,11 @@ def _traverse_subagent_tree(
         for s in root.get("subagents", [])
         if isinstance(s, dict) and isinstance(s.get("thread_id"), str)
     }
-    queue = list(children_by_parent.get(root_tid, []))
+    queue = [(tid, 1, root_tid) for tid in children_by_parent.get(root_tid, [])]
     visited = {root_tid}
 
     while queue:
-        child_tid = queue.pop(0)
+        child_tid, inferred_depth, parent_tid = queue.pop(0)
         if child_tid in visited:
             continue
         visited.add(child_tid)
@@ -600,7 +750,7 @@ def _traverse_subagent_tree(
         if child is not None:
             c_tokens = dict(child.get("token_usage") or _empty_token_usage())
             c_model = child.get("model") or root.get("model")
-            c_cost = estimate_api_cost(c_tokens, c_model)
+            c_cost = estimate_api_cost(c_tokens, c_model) if child.get("rollout_captured") is not False else None
             c_role = (
                 child.get("agent_role")
                 or stub.get("agent_role")
@@ -615,13 +765,34 @@ def _traverse_subagent_tree(
             subagent_records.append(
                 {
                     "thread_id": child_tid,
+                    "parent_thread_id": child.get("parent_thread_id") or parent_tid,
+                    "rollout_captured": child.get("rollout_captured", True),
+                    "final_status": child.get("final_status") or stub.get("final_status"),
                     "agent_role": c_role,
                     "agent_nickname": child.get("agent_nickname"),
-                    "depth": child.get("depth") or 1,
+                    "depth": child.get("depth") or inferred_depth,
                     "model": c_model,
                     "reasoning_effort": child.get("reasoning_effort"),
                     "command_count": c_cmd,
                     "failed_command_count": c_fail,
+                    "start_ts": child.get("start_ts"),
+                    "end_ts": child.get("end_ts"),
+                    "events": child.get("events") or [],
+                    "context_window": child.get("context_window"),
+                    "latest_input_tokens": child.get("latest_input_tokens"),
+                    "latest_input_ts": child.get("latest_input_ts"),
+                    "permission_profile": child.get("permission_profile"),
+                    "sandbox_policy": child.get("sandbox_policy"),
+                    "approval_policy": child.get("approval_policy"),
+                    "network": child.get("network"),
+                    "files_read": child.get("files_read") or [],
+                    "tools_used": child.get("tools_used") or [],
+                    "composition": child.get("composition") or [],
+                    "base_instructions_text": child.get("base_instructions_text") or "",
+                    "git_commit": child.get("git_commit"),
+                    "git_branch": child.get("git_branch"),
+                    "spawn_prompt": child.get("spawn_prompt") or stub.get("prompt"),
+                    "final_message": child.get("final_message") or stub.get("final_message"),
                     "token_usage": c_tokens,
                     "est_cost": c_cost,
                 }
@@ -633,16 +804,21 @@ def _traverse_subagent_tree(
                     stub_by_tid.setdefault(
                         nested_stub["thread_id"], nested_stub
                     )
-            queue.extend(children_by_parent.get(child_tid, []))
+            queue.extend((tid, inferred_depth + 1, child_tid) for tid in children_by_parent.get(child_tid, []))
         else:
             c_role = stub.get("agent_role") or "default"
             c_tokens = _empty_token_usage()
             subagent_records.append(
                 {
                     "thread_id": child_tid,
+                    "parent_thread_id": parent_tid,
+                    "rollout_captured": False,
+                    "spawn_prompt": stub.get("prompt"),
+                    "final_message": stub.get("final_message"),
+                    "final_status": stub.get("final_status"),
                     "agent_role": c_role,
                     "agent_nickname": None,
-                    "depth": 1,
+                    "depth": inferred_depth,
                     "model": None,
                     "reasoning_effort": None,
                     "command_count": 0,
@@ -857,6 +1033,66 @@ def summarize_experiment_outcome(trials: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def _inject_captured_subagents(
+    worker_dir: Path,
+    worker_tid: str,
+    by_tid: dict[str, dict[str, Any]],
+    children_by_parent: dict[str, list[str]],
+) -> None:
+    """Parse captured subagent rollouts under ``worker/subagents/`` into the
+    linkage structures so the subagent tree can be reconstructed even when the
+    originals under ``~/.codex/sessions/`` have been pruned. READ-ONLY.
+
+    Each ``subagents/<thread-id>.jsonl`` is parsed with ``parse_session_rollout``
+    (giving per-agent ``commands`` + timestamps + prompt + tokens). The manifest
+    (``subagents/manifest.json``) supplies lineage (``parent_thread_id``,
+    ``depth``, ``agent_nickname``/``agent_role``) and the spawn ``prompt`` /
+    ``final_message`` that the child's own rollout does not carry.
+    """
+    sub_dir = worker_dir / "subagents"
+    if not sub_dir.is_dir():
+        return
+    manifest = read_json(sub_dir / "manifest.json")
+    records = manifest.get("subagents") if isinstance(manifest, dict) else None
+    manifest_by_tid = {
+        rec["thread_id"]: rec for rec in (records if isinstance(records, list) else [])
+        if isinstance(rec, dict) and isinstance(rec.get("thread_id"), str) and rec["thread_id"]
+    }
+    captured: dict[str, dict[str, Any]] = {}
+    for rollout in sorted(sub_dir.glob("*.jsonl")):
+        parsed = parse_session_rollout(rollout)
+        child_tid = parsed.get("thread_id") or rollout.stem
+        parsed["rollout_path"] = str(rollout)
+        captured[child_tid] = parsed
+
+    for child_tid in sorted(set(captured) | set(manifest_by_tid)):
+        if child_tid == worker_tid:
+            continue
+        # Keep current live usage/events, while still enriching missing lineage
+        # and findings from the captured manifest. Never count both copies.
+        existing = by_tid.get(child_tid)
+        live_trace = existing is not None and existing.get("rollout_captured") is not False
+        parsed = dict(existing if live_trace else captured.get(child_tid, existing or {}))
+        meta = manifest_by_tid.get(child_tid, {})
+        parent = meta.get("parent_thread_id") or parsed.get("parent_thread_id") or worker_tid
+        if not isinstance(parent, str):
+            parent = worker_tid
+        parsed["thread_id"] = child_tid
+        parsed["parent_thread_id"] = parent
+        parsed["rollout_captured"] = live_trace or child_tid in captured
+        if meta.get("depth") is not None:
+            parsed["depth"] = meta["depth"]
+        for key in ("agent_nickname", "agent_role", "model", "reasoning_effort", "final_message", "final_status"):
+            if not parsed.get(key) and meta.get(key) is not None:
+                parsed[key] = meta[key]
+        if not parsed.get("spawn_prompt") and meta.get("prompt"):
+            parsed["spawn_prompt"] = meta["prompt"]
+        by_tid[child_tid] = parsed
+        linked = children_by_parent.setdefault(parent, [])
+        if child_tid not in linked:
+            linked.append(child_tid)
+
+
 def _collect_harness_eval_usage(
     by_tid: dict[str, dict[str, Any]],
     children_by_parent: dict[str, list[str]],
@@ -877,6 +1113,15 @@ def _collect_harness_eval_usage(
             parsed_cwd = parse_eval_run_cwd(entry.get("cwd"), evals_root)
             if parsed_cwd and parsed_cwd.get("trial_dir"):
                 seen_trial_dirs.add(str(parsed_cwd["trial_dir"]))
+
+    # Captured children are needed even if their parent is already in the live
+    # cache. Hydrate both discovery paths before computing subagent totals.
+    for root in eval_root_sessions:
+        location = parse_eval_run_cwd(root.get("cwd"), evals_root)
+        if location and location.get("trial_dir"):
+            _inject_captured_subagents(
+                Path(location["trial_dir"]) / "worker", root["thread_id"], by_tid, children_by_parent
+            )
 
     # Also discover any local worker/trace.jsonl on disk not already in ~/.codex/sessions
     if evals_root.is_dir():
@@ -910,6 +1155,14 @@ def _collect_harness_eval_usage(
             eval_root_sessions.append(parsed_worker)
             seen_tids.add(tid)
             seen_trial_dirs.add(trial_dir_str)
+
+            # The worker's subagents live only in the captured read-only copies
+            # under `worker/subagents/*.jsonl` (the originals in ~/.codex/sessions
+            # may have been pruned). Parse them into `by_tid`/`children_by_parent`
+            # so the subagent tree + per-agent timelines can be reconstructed.
+            _inject_captured_subagents(
+                worker_trace.parent, tid, by_tid, children_by_parent
+            )
 
     # Scan semantic judge traces on disk (`grades/semantic/judge-*/trace.jsonl`)
     judges_by_trial_dir: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1246,6 +1499,21 @@ def _collect_harness_eval_usage(
                 "command_count": cmds,
                 "failed_command_count": failed_cmds,
                 "commands": root.get("commands") or [],
+                "activity_tree": {
+                    "thread_id": root_tid,
+                    **{key: root.get(key) for key in (
+                        "agent_nickname", "agent_role", "depth", "model", "reasoning_effort",
+                        "start_ts", "end_ts", "events", "context_window", "latest_input_tokens", "latest_input_ts", "permission_profile",
+                        "sandbox_policy", "approval_policy", "network", "files_read", "tools_used",
+                        "composition", "base_instructions_text", "git_commit", "git_branch", "token_usage",
+                    )},
+                    "children": subagent_records,
+                },
+                **{key: root.get(key) for key in (
+                    "start_ts", "end_ts", "events", "context_window", "latest_input_tokens", "latest_input_ts", "permission_profile",
+                    "sandbox_policy", "approval_policy", "network", "files_read", "tools_used",
+                    "composition", "base_instructions_text", "git_commit", "git_branch", "token_usage",
+                )},
                 "first_prompt": root.get("first_prompt") or "",
                 "subagent_spawn_count": spawns,
                 "subagents": subagent_records,
@@ -1649,6 +1917,21 @@ def build_project_usage(
                 "command_count": cmds,
                 "failed_command_count": failed_cmds,
                 "commands": root.get("commands") or [],
+                "activity_tree": {
+                    "thread_id": root_tid,
+                    **{key: root.get(key) for key in (
+                        "agent_nickname", "agent_role", "depth", "model", "reasoning_effort",
+                        "start_ts", "end_ts", "events", "context_window", "latest_input_tokens", "latest_input_ts", "permission_profile",
+                        "sandbox_policy", "approval_policy", "network", "files_read", "tools_used",
+                        "composition", "base_instructions_text", "git_commit", "git_branch", "token_usage",
+                    )},
+                    "children": subagent_records,
+                },
+                **{key: root.get(key) for key in (
+                    "start_ts", "end_ts", "events", "context_window", "latest_input_tokens", "latest_input_ts", "permission_profile",
+                    "sandbox_policy", "approval_policy", "network", "files_read", "tools_used",
+                    "composition", "base_instructions_text", "git_commit", "git_branch", "token_usage",
+                )},
                 "first_prompt": root.get("first_prompt") or "",
                 "skills_used": sorted(session_skills.keys()),
                 "skill_invocations": session_skills,

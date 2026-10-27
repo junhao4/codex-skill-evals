@@ -33,6 +33,16 @@ class RelocationTests(unittest.TestCase):
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
+    def test_inventory_uses_registered_skill_directory_for_both_layouts(self):
+        registered = self.root / ".agents/skills/registered/SKILL.md"
+        registered.parent.mkdir(parents=True)
+        registered.write_text("# Registered\n")
+        unrelated = self.root / "workflow/skills/unregistered/SKILL.md"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("# Unregistered\n")
+        for layout in (".agents/evals", "workflow/evals"):
+            with self.subTest(layout=layout):
+                self.assertEqual(discover_project_inventory(self.root, self.root / layout)["skills"], ["registered"])
 
     def recorded_trial(self, experiment, marker=".agents/evals"):
         relative = f"review/runs/{experiment}/trials/case/with-skill/trial-01"
