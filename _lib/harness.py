@@ -201,10 +201,80 @@ def run_trial(
     model: str | None,
     semantic_deferred: bool = False,
 ) -> dict[str, Any]:
+    # Validate before creating output, including for direct API callers.
     if run_dir.exists():
         raise HarnessError(f"refusing to overwrite run: {run_dir}")
+    if configuration not in {"baseline", "with-skill"}:
+        raise HarnessError(f"unknown trial configuration: {configuration}")
     validate_fixture(case.fixture)
-    run_dir.mkdir(parents=True)
+    options = dict(case=case, skill_root=skill_root, configuration=configuration,
+                   trial=trial, run_dir=run_dir, schema=schema,
+                   semantic_enabled=semantic_enabled, semantic_judges=semantic_judges,
+                   timeout=timeout, model=model, semantic_deferred=semantic_deferred)
+    # Creation stays outside recovery: never touch an existing run after a race.
+    run_dir.mkdir(parents=True, exist_ok=False)
+    started = now()
+    try:
+        return _execute_trial(**options)
+    except (Exception, KeyboardInterrupt) as error:
+        try:
+            _record_aborted_trial(case, skill_root.name, configuration, trial, run_dir, started, error)
+        except Exception as recovery_error:
+            # Recovery must not replace the original exception or interruption.
+            print(f"Could not persist partial trial result at {run_dir}: {recovery_error}", file=sys.stderr)
+        raise
+
+
+def _record_aborted_trial(case: Case, skill: str, configuration: str, trial: int,
+                          run_dir: Path, started: str, error: BaseException) -> None:
+    """Persist explicit failure without grading or deleting partial evidence."""
+    status = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+    reason = f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+    metadata = read_json(run_dir / "run.json") or {
+        "skill": skill, "test_case": case.name,
+        "configuration": configuration, "trial": trial, "started_at": started,
+    }
+    metadata.update(status=status, completed_at=now(), error=reason)
+    worker = read_json(run_dir / "worker/result.json") or {}
+    result = {
+        "status": status, "skill": metadata.get("skill"), "test_case": case.name,
+        "configuration": configuration, "trial": trial, "overall_pass": False,
+        "needs_review": False, "score": None,
+        "worker_exit_code": worker.get("exit_code"),
+        "protected_inputs_intact": worker.get("protected_inputs_intact"),
+        "worker_turns_planned": 1 + len(case.interactions),
+        "worker_turns_completed": worker.get("turns_completed", len(list((run_dir / "worker/turns").glob("*/state.json")))),
+        "failure_reasons": [reason], "error_type": type(error).__name__,
+        "run_directory": str(run_dir), "completed_at": metadata["completed_at"],
+    }
+    # Keep measured worker usage even when grading or later capture failed.
+    metrics = worker.get("metrics")
+    if isinstance(metrics, dict):
+        result["tokens"] = {key: metrics[key] for key in (
+            "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+            "uncached_input_tokens", "output_tokens", "reasoning_output_tokens",
+            "billed_output_tokens",
+        ) if key in metrics}
+    if worker.get("elapsed_seconds") is not None:
+        result["worker_elapsed_seconds"] = worker["elapsed_seconds"]
+    for key in ("resolved_model", "resolved_reasoning_effort"):
+        if metadata.get(key) is not None:
+            result[key] = metadata[key]
+    # Write the failure first, so later metadata/trace errors cannot leave a pass.
+    write_json(run_dir / "result.json", result)
+    write_json(run_dir / "run.json", metadata)
+    trace = run_dir / "worker/trace.jsonl"
+    if not trace.exists():
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        concatenate_files(sorted((run_dir / "worker/turns").glob("*/trace.jsonl")), trace)
+        sanitize_trace_jsonl(trace, trace)
+
+
+def _execute_trial(
+    *, case: Case, skill_root: Path, configuration: str, trial: int,
+    run_dir: Path, schema: Path, semantic_enabled: bool, semantic_judges: int,
+    timeout: int, model: str | None, semantic_deferred: bool = False,
+) -> dict[str, Any]:
     workspace = run_dir / "workspace"
     worker_dir = run_dir / "worker"
     turns_root = worker_dir / "turns"
@@ -289,6 +359,7 @@ def run_trial(
         "workspace_git_metadata_removed": False,
         "initial_git_state": git_state(workspace),
         "started_at": now(),
+        "status": "running",
     }
     write_json(run_dir / "run.json", metadata)
 
@@ -520,6 +591,7 @@ def run_trial(
     # normal final-state snapshot that the parent project can traverse safely.
     remove_workspace_git_metadata(workspace)
     metadata["workspace_git_metadata_removed"] = True
+    metadata["status"] = "completed"
     metadata["completed_at"] = now()
     write_json(run_dir / "run.json", metadata)
 

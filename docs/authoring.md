@@ -62,7 +62,13 @@ finish, the harness exports the Git evidence under `git/` and removes
 `workspace/.git/`. The retained `workspace/` is therefore an ordinary snapshot
 of the worker's final files, not a nested repository. If a trial is interrupted
 before grading finishes, `.git/` is retained to help diagnose the incomplete
-run.
+run. Recoverable exceptions and Ctrl-C now also persist a terminal trial
+`result.json` (`failed` or `interrupted`, with no score), update `run.json`, and
+include the aborted trial in the experiment's partial report. Available worker
+usage is retained; unavailable exit/integrity evidence remains unknown. No
+automatic resume or overwrite is attempted. Failure recording is best effort
+when the output filesystem itself fails; forced termination such as SIGKILL
+cannot be caught by this mechanism.
 
 The harness constructs the repository-local skill set after copying the
 fixture:

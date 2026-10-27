@@ -117,3 +117,14 @@ writes per-project real-work usage files under `.agents/evals/_usage/`:
 | `_usage/report.md` | Ignored by default | Markdown summary of the same project-scoped session, skill, subagent, model, and daily metrics |
 | `_usage/summary.json` | Ignored by default | Machine-readable aggregate metrics and per-session records |
 | `_usage/cache.json` | Ignored | Incremental `(mtime_ns, size)` parse cache for `~/.codex/sessions/` rollouts |
+
+## Aborted trial records
+
+On ordinary exceptions or Ctrl-C after a trial directory is reserved, the harness
+attempts to write a trial `result.json` with `status: failed` or `interrupted`,
+`overall_pass: false`, `score: null`, and failure details. It updates `run.json`
+and preserves the partial workspace (including Git metadata when still present),
+turn traces, and any exported evidence. Available worker usage remains recorded;
+missing measurements are not invented. The CLI includes retained trial results
+in failed/interrupted experiment reports. This is failure recording, not automatic
+resumption; forced process termination and unwritable storage can prevent it.

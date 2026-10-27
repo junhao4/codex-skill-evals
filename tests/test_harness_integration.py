@@ -303,11 +303,82 @@ def test_fixture_symlinks_are_rejected_before_copy_or_execution(trial_case, monk
     assert (outside / 'secret.txt').read_text() == 'source must stay unchanged'
 
 
+@pytest.mark.parametrize('phase', ['worker', 'checker'])
+@pytest.mark.parametrize('exception_type', [KeyboardInterrupt, OSError, RuntimeError])
+def test_aborted_trial_retains_terminal_failure_and_partial_evidence(trial_case, monkeypatch, phase, exception_type):
+    case, _, run_dir = trial_case
+    simulate_worker(monkeypatch)
+    def abort(*args, **kwargs):
+        if phase == 'worker':
+            kwargs['stdout_path'].write_text('{"type":"thread.started","thread_id":"partial"}\n')
+        raise exception_type('injected interruption')
+    monkeypatch.setattr(harness, 'run_command' if phase == 'worker' else 'run_checker', abort)
+    with pytest.raises(exception_type):
+        run_case(trial_case)
+    result = json.loads((run_dir / 'result.json').read_text())
+    expected = 'interrupted' if exception_type is KeyboardInterrupt else 'failed'
+    assert result['status'] == expected
+    assert result['overall_pass'] is False and result['score'] is None
+    assert result['needs_review'] is False
+    assert result['failure_reasons']
+    assert result['error_type'] == exception_type.__name__
+    assert (run_dir / 'workspace/.git').is_dir()
+    assert (run_dir / 'worker/trace.jsonl').is_file()
+    metadata = json.loads((run_dir / 'run.json').read_text())
+    assert metadata['status'] == expected and metadata['completed_at']
+    assert (case.fixture / 'source.txt').read_text() == 'original'
+    if phase == 'worker':
+        assert result['worker_exit_code'] is None
+        assert result['protected_inputs_intact'] is None
+    else:
+        assert result['worker_exit_code'] == 0
+        assert result['protected_inputs_intact'] is True
+        assert (run_dir / 'git/changes.patch').is_file()
+        assert result['tokens']['input_tokens'] == 100
+        assert result['worker_elapsed_seconds'] >= 0
+    with pytest.raises(HarnessError):
+        run_case(trial_case)
+
+
+@pytest.mark.parametrize('exception_type', [KeyboardInterrupt, OSError, RuntimeError])
+def test_cli_partial_report_includes_aborted_trial(trial_case, monkeypatch, exception_type):
+    import eval as cli
+    from types import SimpleNamespace
+    case, skill, _ = trial_case
+    monkeypatch.setattr(cli, 'load_cases', lambda *args: {case.name: case})
+    monkeypatch.setattr(cli, 'SKILLS_ROOT', skill.parent)
+    def abort(*args, **kwargs):
+        raise exception_type('injected failure')
+    monkeypatch.setattr(harness, 'run_command', abort)
+    args = SimpleNamespace(trials=1, judges=1, skill='demo', test_case=None,
+                           no_semantic_judges=True, compare=False, parallel=False)
+    if exception_type is KeyboardInterrupt:
+        assert cli.run_evaluation(args, {'demo': case.root.parents[1]}) == 130
+    else:
+        with pytest.raises(SystemExit):
+            cli.run_evaluation(args, {'demo': case.root.parents[1]})
+    experiment = case.root.parents[1] / 'runs/experiment-001'
+    data = json.loads((experiment / 'experiment.json').read_text())
+    assert data['status'] == ('interrupted' if exception_type is KeyboardInterrupt else 'failed')
+    assert not data['overall_pass']
+    assert len(data['results']) == 1 and not data['results'][0]['overall_pass']
+    assert 'injected failure' in (experiment / 'report.md').read_text()
 
 
 
-
-
+def test_recovery_write_failure_preserves_original_interruption(trial_case, monkeypatch, capsys):
+    original_write = harness.write_json
+    def write(path, value):
+        if path.name == 'result.json':
+            raise OSError('disk unavailable')
+        return original_write(path, value)
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt('original interruption')
+    monkeypatch.setattr(harness, 'write_json', write)
+    monkeypatch.setattr(harness, 'run_command', interrupt)
+    with pytest.raises(KeyboardInterrupt, match='original interruption'):
+        run_case(trial_case)
+    assert 'Could not persist partial trial result' in capsys.readouterr().err
 
 
 def test_nested_fixture_directory_link_is_rejected(trial_case, monkeypatch):

@@ -271,6 +271,17 @@ def check_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     return 0
 
 
+def _retained_trial_results(experiment_root: Path, results: list[dict]) -> list[dict]:
+    """Include interrupted trials and the latest persisted deferred grades."""
+    by_trial = {(r["test_case"], r["configuration"], r["trial"]): r for r in results}
+    for path in sorted((experiment_root / "trials").glob("*/*/*/result.json")):
+        result = read_json(path)
+        if isinstance(result, dict) and all(key in result for key in
+                ("test_case", "configuration", "trial", "status", "overall_pass")):
+            by_trial[(result["test_case"], result["configuration"], result["trial"])] = result
+    return list(by_trial.values())
+
+
 def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
     if args.trials < 1:
         fail("--trials must be at least 1")
@@ -419,12 +430,14 @@ def run_evaluation(args: argparse.Namespace, skills: dict[str, Path]) -> int:
                 flush=True,
             )
     except KeyboardInterrupt:
+        results = _retained_trial_results(experiment_root, results)
         experiment["status"] = "interrupted"
         experiment["completed_at"] = now()
         _, report = finalize_experiment(experiment_root, experiment, results)
         print(f"\nInterrupted. Partial report: {report}")
         return 130
-    except HarnessError as error:
+    except Exception as error:
+        results = _retained_trial_results(experiment_root, results)
         experiment["status"] = "failed"
         experiment["error"] = str(error)
         experiment["completed_at"] = now()
