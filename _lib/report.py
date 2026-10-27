@@ -87,6 +87,9 @@ def aggregate(results: list[dict]) -> dict:
         cell["total_trials"] += 1
         # Timing includes failed and abstained trials, unlike score means.
         cell["timing_samples"].append(result)
+        tokens = result.get("tokens")
+        if isinstance(tokens, dict):
+            cell["token_samples"].append(tokens)
         if result.get("needs_review") or result.get("status") == "needs_review":
             # Neither a pass nor a fail: an honest "not enough evidence to
             # decide". Excluded from passed_trials and from the score mean.
@@ -103,9 +106,7 @@ def aggregate(results: list[dict]) -> dict:
         sem_s = result.get("semantic_score")
         if isinstance(sem_s, (int, float)) and not isinstance(sem_s, bool):
             cell["sem_scores"].append(sem_s)
-        tokens = result.get("tokens")
-        if isinstance(tokens, dict):
-            cell["token_samples"].append(tokens)
+
 
     comparisons: dict[str, dict] = {}
     for test_case_name, configurations in cells.items():

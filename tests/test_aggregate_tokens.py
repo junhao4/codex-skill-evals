@@ -80,3 +80,14 @@ def test_missing_tokens_does_not_crash():
     assert cell["mean_score"] == 50.0
     # mean_tokens present but zeroed when no token data exists
     assert cell["mean_tokens"]["billed_output_tokens"] == 0
+
+
+def test_needs_review_trials_still_count_in_token_usage():
+    decided = _result('case-a', 'with-skill', 90, _tokens(100, 0, 20, 0))
+    undecided = {**_result('case-a', 'with-skill', None, _tokens(300, 0, 60, 0), False),
+                 'status': 'needs_review', 'needs_review': True}
+    cell = eval_mod.aggregate([decided, undecided])['cells']['case-a']['with-skill']
+    assert cell['mean_score'] == 90
+    assert cell['needs_review_trials'] == 1
+    assert cell['mean_tokens']['input_tokens'] == 200
+    assert cell['mean_tokens']['billed_output_tokens'] == 40
