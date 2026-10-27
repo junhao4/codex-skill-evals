@@ -532,8 +532,8 @@ def test_build_project_usage_scopes_sessions_and_rolls_up_subagents(tmp_path):
     assert "Benchmarked Skills" in html
     assert "Experiment Run History" in html
     # Content still flows through
-    assert "Real Project Work" in html
-    assert "Harness Eval Calls" in html
+    assert "Online eval" in html
+    assert "Offline eval" in html
     assert "unused-skill" in html
     assert "security-reviewer" in html
     # The one evaluated skill (code-review) produces a clickable experiment

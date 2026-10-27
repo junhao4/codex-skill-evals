@@ -88,6 +88,11 @@ def test_manifest_return_survives_missing_rollout(captured_trial):
     assert child["est_cost"] is None
     assert not child["events"]
 
+    from _lib.usage_html import _timeline_component
+    html = _timeline_component(trial["activity_tree"], "missing-child")
+    assert "Recorded returned finding" in html
+    assert "openTimelineActor('missing-child-agent-0')" in html
+
 
 def test_missing_child_stays_missing_on_repeat_and_recovers_when_file_arrives(captured_trial):
     project, evals, worker, root = captured_trial
