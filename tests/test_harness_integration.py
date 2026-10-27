@@ -175,8 +175,23 @@ def test_multiple_turns_resume_same_thread_and_sum_tokens_once(trial_case, monke
     assert calls[1].count("--model") == 1
 
 
+@pytest.mark.parametrize("evidence", [None, {}, {"worker_exit_code": 0}, {"protected_inputs_intact": True}, {"worker_exit_code": False, "protected_inputs_intact": True}])
+def test_regrade_refuses_missing_worker_evidence(tmp_path, monkeypatch, evidence):
+    if evidence is not None:
+        (tmp_path / "result.json").write_text(json.dumps(evidence))
+    monkeypatch.setattr(harness, "run_semantic_grader", lambda *args: {"status": "completed", "result": grade(), "judges": [1], "errors": []})
+    with pytest.raises(HarnessError, match="worker|trial result"):
+        harness.regrade_with_semantic(case=None, run_dir=tmp_path, schema=SCHEMA,
+                                     timeout=10, model=None, judge_count=1)
 
 
+@pytest.mark.parametrize("worker_exit, protected", [(1, True), (0, False)])
+def test_regrade_cannot_erase_worker_failure_or_tampering(tmp_path, monkeypatch, worker_exit, protected):
+    (tmp_path / "result.json").write_text(json.dumps({"worker_exit_code": worker_exit, "protected_inputs_intact": protected}))
+    monkeypatch.setattr(harness, "run_semantic_grader", lambda *args: {"status": "completed", "result": grade(), "judges": [1], "errors": []})
+    result = harness.regrade_with_semantic(case=None, run_dir=tmp_path, schema=SCHEMA, timeout=10, model=None, judge_count=1)
+    assert result["score"] == 100
+    assert not result["overall_pass"]
 
 
 @pytest.mark.parametrize("output", ["[]", "not json", json.dumps(grade()) + "\\ninvalid trailing data"])
@@ -220,3 +235,49 @@ def test_semantic_runner_handles_bad_judges_without_losing_others(trial_case, mo
     assert result["status"] == expected
     assert len(result["judges"]) == len(modes)
     assert (run_dir / "grades" / "semantic" / "result.json").is_file()
+
+
+@pytest.mark.parametrize('artifact', [None, {}, {'status': 'completed', 'result': {'score': 100}}, {'status': 'not_requested', 'result': None}])
+def test_regrade_requires_retained_deterministic_evidence(trial_case, monkeypatch, artifact):
+    case, _, run_dir = trial_case
+    run_dir.mkdir()
+    (run_dir / 'result.json').write_text(json.dumps({
+        'worker_exit_code': 0, 'protected_inputs_intact': True,
+        'deterministic_status': 'completed', 'overall_pass': False,
+    }))
+    if artifact is not None:
+        target = run_dir / 'grades/deterministic/result.json'
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps(artifact))
+    calls = []
+    monkeypatch.setattr(harness, 'run_semantic_grader', lambda *args: calls.append(args))
+    with pytest.raises(HarnessError, match='deterministic'):
+        harness.regrade_with_semantic(case=case, run_dir=run_dir, schema=SCHEMA,
+                                     timeout=10, model=None, judge_count=1)
+    assert not calls
+    assert not json.loads((run_dir / 'result.json').read_text())['overall_pass']
+
+
+def test_checker_cannot_turn_abstention_into_passing_score(trial_case):
+    case, _, run_dir = trial_case
+    case.checker.write_text('import json\nprint(json.dumps(' + repr(grade(verdict='insufficient_evidence')) + '))\n')
+    result = grading.run_checker(case, case.fixture, run_dir, 10)
+    assert result['status'] == 'invalid'
+    assert any('abstain' in error for error in result['errors'])
+
+
+@pytest.mark.parametrize('det_status, det_score, expected_pass', [('completed', 100, True), ('completed', 0, False), ('invalid', 100, False)])
+def test_regrade_preserves_retained_checker_decision(trial_case, monkeypatch, det_status, det_score, expected_pass):
+    case, _, run_dir = trial_case
+    run_dir.mkdir()
+    (run_dir / 'result.json').write_text(json.dumps({
+        'worker_exit_code': 0, 'protected_inputs_intact': True,
+        'deterministic_status': det_status, 'overall_pass': False,
+    }))
+    target = run_dir / 'grades/deterministic/result.json'
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({'status': det_status, 'result': grade(det_score), 'errors': []}))
+    monkeypatch.setattr(harness, 'run_semantic_grader', lambda *args: {'status': 'completed', 'result': grade(), 'judges': [], 'errors': []})
+    result = harness.regrade_with_semantic(case=case, run_dir=run_dir, schema=SCHEMA,
+                                         timeout=10, model=None, judge_count=1)
+    assert result['overall_pass'] is expected_pass

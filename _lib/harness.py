@@ -604,13 +604,31 @@ def regrade_with_semantic(
     """Add semantic grading to a trial already run without judges, and rewrite
     its result.json. Used by the parallel path so judges can be batched after
     all workers finish. Reuses run_semantic_grader and the persisted grades."""
-    result = read_json(run_dir / "result.json") or {}
+    result = read_json(run_dir / "result.json")
+    if (
+        not isinstance(result, dict)
+        or type(result.get("worker_exit_code")) is not int
+        or not isinstance(result.get("protected_inputs_intact"), bool)
+    ):
+        raise HarnessError(
+            f"cannot regrade without a valid trial result and worker integrity evidence: {run_dir}"
+        )
+    deterministic = read_json(run_dir / "grades" / "deterministic" / "result.json")
+    deterministic_required = (
+        (case is not None and case.checker is not None)
+        or result.get("deterministic_status") not in (None, "not_requested")
+    )
+    if deterministic_required:
+        if not deterministic or deterministic.get("status") not in ("completed", "invalid"):
+            raise HarnessError(f"cannot regrade without retained deterministic evidence: {run_dir}")
+        if deterministic["status"] == "completed":
+            retained_grade = deterministic.get("result")
+            valid, errors = validate_grade(retained_grade if isinstance(retained_grade, dict) else None)
+            if not valid:
+                raise HarnessError(f"cannot regrade with malformed deterministic evidence: {run_dir}: {errors}")
+    if deterministic is None:
+        deterministic = {"status": "not_requested", "result": None, "errors": []}
     semantic = run_semantic_grader(case, run_dir, schema, timeout, model, judge_count)
-    deterministic = read_json(run_dir / "grades" / "deterministic" / "result.json") or {
-        "status": "not_requested",
-        "result": None,
-        "errors": [],
-    }
 
     outcome = grade_outcome(deterministic, semantic)
     graders_valid = outcome["graders_valid"]
@@ -618,8 +636,8 @@ def regrade_with_semantic(
     det_result = deterministic.get("result")
     sem_result = semantic.get("result")
     headline = outcome["headline"]
-    protected = result.get("protected_inputs_intact", True)
-    worker_exit = result.get("worker_exit_code", 0)
+    protected = result["protected_inputs_intact"]
+    worker_exit = result["worker_exit_code"]
     trial_needs_review = (
         outcome["needs_review"] and worker_exit == 0 and protected
     )

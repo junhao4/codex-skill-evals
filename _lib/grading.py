@@ -183,6 +183,9 @@ def run_checker(
     valid, errors = validate_grade(result)
     if completed.returncode != 0:
         errors.append(f"grader exited with code {completed.returncode}")
+    if isinstance(result, dict) and result.get("verdict") == ABSTAIN_VERDICT:
+        valid = False
+        errors.append("deterministic graders cannot abstain; report a score or an explicit checker error")
     status = "completed" if completed.returncode == 0 and valid else "invalid"
     if status == "completed" and isinstance(result, dict):
         # Score is authoritative for deterministic graders just as for the
@@ -492,6 +495,7 @@ def grade_outcome(deterministic: dict, semantic: dict) -> dict[str, Any]:
     needs_review = (
         bool(requested_grades)
         and not any_invalid
+        and not any(grade["status"] == "completed" and not _grade_passed(grade) for grade in requested_grades)
         and any(grade["status"] == "needs_review" for grade in requested_grades)
     )
     deterministic_result = deterministic.get("result")

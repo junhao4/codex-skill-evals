@@ -114,3 +114,10 @@ def test_grade_outcome_nothing_requested_is_invalid():
     assert out["graders_pass"] is False
     assert out["headline"] is None
 
+
+
+def test_completed_grader_failure_is_not_hidden_by_other_grader_abstention():
+    outcome = grade_outcome(_grade('completed', False, 0), _grade('needs_review'))
+    assert not outcome['needs_review']
+    assert not outcome['graders_pass']
+    assert outcome['headline']['score'] == 0
