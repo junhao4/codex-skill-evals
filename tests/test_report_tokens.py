@@ -246,3 +246,63 @@ def test_report_renders_det_sem_and_passing_deductions(tmp_path):
     # Total row in Token usage
     assert "| **Total (2 trials)** |" in text
 
+
+def test_report_findings_link_workspace_files_without_changing_results(tmp_path):
+    import copy
+    from urllib.parse import unquote
+
+    run_dir = tmp_path / "trials/case-a/with-skill/trial-01"
+    task = run_dir / "workspace/workflow/tasks/my-quizzes-empty-state.md"
+    task.parent.mkdir(parents=True)
+    task.write_text("Baseline: Current worktree\n")
+    result = _result("case-a", "with-skill", 69, 100, overall_pass=False)
+    result.update(run_directory=str(run_dir), deterministic_score=69, semantic_score=100,
+                  failure_reasons=["deterministic/local-references-and-baseline: my-quizzes-empty-state.md: baseline is not an initial revision"])
+    experiment = {"skill": "demo", "status": "completed", "overall_pass": False,
+                  "mean_score": 69, "passed_trials": 0, "worker_trials": 1}
+    before = copy.deepcopy((experiment, result))
+    report = eval_mod.write_report(tmp_path, experiment, eval_mod.aggregate([result]), [result])
+    text = report.read_text()
+    relative = "trials/case-a/with-skill/trial-01/workspace/workflow/tasks/my-quizzes-empty-state.md"
+    assert f"[my-quizzes-empty-state.md]({relative})" in text
+    assert (report.parent / unquote(relative)).resolve() == task.resolve()
+    assert "| case-a | with-skill | 1 | 69 | 69 | 100 | partial | No |" in text
+    assert (experiment, result) == before
+
+
+
+def test_finding_links_leave_missing_ambiguous_escaped_and_existing_refs_alone(tmp_path):
+    from _lib.report import _finding_text
+
+    run_dir = tmp_path / "trials/example"
+    workspace = run_dir / "workspace"
+    for relative in ("frontend/README.md", "backend/README.md", "workflow/tasks/task.md"):
+        path = workspace / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture\n")
+    outside = run_dir / "outside.md"
+    outside.write_text("outside\n")
+    (workspace / "shortcut.md").symlink_to(outside)
+    text = "README.md missing.md shortcut.md ../outside.md `task.md` [task.md](already-linked.md)"
+    assert _finding_text(text, run_dir, tmp_path) == text
+    assert _finding_text("task.md", tmp_path / "absent", tmp_path) == "task.md"
+    assert _finding_text("task.md", None, tmp_path) == "task.md"
+    linked = _finding_text("frontend/README.md", run_dir, tmp_path)
+    assert "[frontend/README.md](trials/example/workspace/frontend/README.md)" == linked
+
+
+
+def test_report_links_encode_markdown_special_characters_and_stay_relative(tmp_path):
+    from _lib.report import _finding_text, _report_link
+
+    run_dir = tmp_path / "trials/case (a)#1"
+    task = run_dir / "workspace/task.md"
+    task.parent.mkdir(parents=True)
+    task.write_text("fixture\n")
+    assert _finding_text("task.md", run_dir, tmp_path) == (
+        "[task.md](trials/case%20%28a%29%231/workspace/task.md)"
+    )
+    assert _report_link("result.json", Path("trials/x/result.json"), tmp_path) == (
+        "[result.json](trials/x/result.json)"
+    )
+

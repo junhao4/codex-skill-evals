@@ -1,0 +1,2 @@
+# Harness regression tests only; not an application dependency.
+pytest==8.4.2

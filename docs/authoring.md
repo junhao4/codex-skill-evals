@@ -321,6 +321,13 @@ snapshots them in `agent-profile-snapshot/`, passes equivalent `-c agents.<name>
 overrides to `codex exec`, and treats them as protected inputs alongside injected
 skills.
 
+Both configurations receive the same declared profiles; baseline excludes the
+target skill. The harness does not copy global agent configuration. Verify
+actual child role metadata and behavior rather than treating a role mentioned
+in a spawn prompt as proof that the role ran. Role instructions do not create
+an independent sandbox, and an unavailable role should be reported as a blocker
+rather than silently replaced with a different agent.
+
 Because the setup commit includes `TASK.md`, injected skills, and any declared
 agent profiles, `HEAD` starts one commit ahead of `fixture-target`. In test
 cases that inspect a baseline Git revision, use the `fixture-target` tag rather
@@ -361,4 +368,3 @@ shape. It does not execute `check.py` or assess whether `expected.md` contains
 sensible scoring criteria. Successful output therefore says that the test case
 definitions are structurally valid—not that their graders are correct. No
 model calls are made.
-

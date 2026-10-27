@@ -649,3 +649,74 @@ def test_trace_metrics_parses_persisted_rollout_format(tmp_path):
     assert m["subagents"][0]["final_status"] == "completed"
     assert m["subagents"][0]["final_message"] == "Audit finished cleanly."
 
+
+def _named_activity_events():
+    def call(name, call_id, arguments):
+        return {"type": "response_item", "payload": {"type": "function_call",
+                "namespace": "collaboration", "name": name, "call_id": call_id,
+                "arguments": json.dumps(arguments)}}
+    def activity(kind):
+        return {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+            "type": "SubAgentActivity", "kind": kind, "id": "spawn-1" if kind == "started" else "done-1",
+            "agent_thread_id": "child-01", "agent_path": "/root/worker"}}}
+    return [
+        {"type": "session_meta", "payload": {"id": "parent-01"}},
+        call("spawn_agent", "spawn-1", {"agent_type": "specialist", "fork_turns": "none",
+                                      "message": "opaque runtime payload"}),
+        activity("started"),
+        call("wait_agent", "wait-1", {"timeout_ms": 300000}),
+        activity("completed"),
+        {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+            "type": "CollabAgentToolCall", "id": "wait-1", "tool": "wait",
+            "status": "completed", "receiver_thread_ids": [], "agents_states": {}}}},
+    ]
+
+
+
+def test_named_function_activity_spawn_wait_and_readonly_capture(tmp_path):
+    events = _named_activity_events()
+    trace = _write_jsonl(tmp_path / "parent.jsonl", events)
+    metrics = trace_metrics(trace)
+    assert metrics["subagent_spawn_count"] == 1
+    assert metrics["subagent_wait_count"] == 1
+    assert metrics["subagents"][0]["waited"] is True
+    assert metrics["subagents"][0]["agent_role"] == "specialist"
+    assert metrics["subagents"][0]["fork_turns"] == "none"
+    sessions = tmp_path / "sessions"
+    child = _write_jsonl(sessions / "rollout-child-01.jsonl", [
+        {"type": "session_meta", "payload": {"id": "child-01"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 40, "output_tokens": 5}},
+    ])
+    before = child.read_bytes()
+    captured = capture_subagent_rollouts(trace, tmp_path / "captured", sessions)
+    assert captured["subagents"][0]["rollout_captured"] is True
+    assert captured["subagents"][0]["agent_role"] == "specialist"
+    assert captured["subagent_token_usage"]["input_tokens"] == 40
+    assert child.read_bytes() == before
+    nested = read_rollout_metrics(trace)
+    assert nested["spawned_thread_ids"] == ["child-01"]
+
+
+
+def test_spawn_request_without_started_activity_is_not_execution(tmp_path):
+    events = _named_activity_events()[:2]
+    assert trace_metrics(_write_jsonl(tmp_path / "trace.jsonl", events))["subagent_spawn_count"] == 0
+
+
+
+def test_wait_does_not_attach_children_completed_before_it(tmp_path):
+    events = _named_activity_events()
+    events[3], events[4] = events[4], events[3]
+    metrics = trace_metrics(_write_jsonl(tmp_path / "trace.jsonl", events))
+    assert metrics["subagents"][0]["waited"] is False
+
+
+
+def test_explicit_runtime_skill_injection_is_consumption(tmp_path):
+    payload = {"type": "message", "role": "user", "content": [{"type": "input_text", "text":
+        "<skill>\n<name>example</name>\n<path>/repo/.agents/skills/example/SKILL.md</path>\n"
+        "---\nname: example\n---\nInstructions.\n</skill>"}]}
+    trace = _write_jsonl(tmp_path / "trace.jsonl", [{"type": "response_item", "payload": payload}])
+    assert trace_metrics(trace, "example")["skill_read_observed"] is True
+    assert trace_metrics(trace, "another")["skill_read_observed"] is False
+

@@ -44,6 +44,9 @@ detail than the report provides. Follow the links in `report.md` into
 When `report.md` or `eval.py compare` reads trial evidence through a recorded
 `run_directory`, the harness resolves relocated checkouts against the active
 evaluation root first and never rewrites historical manifests.
+This supports moving a checkout or changing the installation between
+`.agents/evals/` and `workflow/evals/`. Missing raw trial artifacts remain
+unavailable; the summary cannot reconstruct them.
 
 ### Worker runtime
 
@@ -58,6 +61,7 @@ grading. Means and ranges include all timed trials regardless of pass/fail or
 `needs_review` outcome. Legacy runs that only recorded timing in
 `worker/metrics.json` are read without modifying the saved artifacts; runs
 with no timing data render as `N/A`.
+Concurrent subagent durations are not added to worker wall-clock time.
 
 Each trial directory contains:
 
@@ -109,7 +113,7 @@ writes per-project real-work usage files under `.agents/evals/_usage/`:
 
 | Output | Tracked in Git? | Meaning |
 |---|---:|---|
-| `_usage/report.html` | Optional | Self-contained interactive HTML dashboard with KPI cards, project skill & subagent usage tables, model mix, daily token bars, and a filterable session log |
-| `_usage/report.md` | Optional | Markdown summary of the same project-scoped session, skill, subagent, model, and daily metrics |
-| `_usage/summary.json` | Optional | Machine-readable aggregate metrics and per-session records |
+| `_usage/report.html` | Ignored by default | Self-contained interactive HTML dashboard with KPI cards, project skill & subagent usage tables, model mix, daily token bars, and a filterable session log |
+| `_usage/report.md` | Ignored by default | Markdown summary of the same project-scoped session, skill, subagent, model, and daily metrics |
+| `_usage/summary.json` | Ignored by default | Machine-readable aggregate metrics and per-session records |
 | `_usage/cache.json` | Ignored | Incremental `(mtime_ns, size)` parse cache for `~/.codex/sessions/` rollouts |
